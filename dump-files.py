@@ -2,7 +2,7 @@ import os
 
 def record_files():
     # The files you want to target
-    target_files = ['graph.py', 'agents.py', 'state.py', 'main.py']
+    target_files = ['graph.py', 'agents.py', 'state.py', 'main.py', 'config.py', 'file_tools.py']
     output_filename = 'project_summary.txt'
     
     # Get the directory where this script is running

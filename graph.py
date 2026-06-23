@@ -5,6 +5,7 @@ from state import SoftwareState
 from agents import (
     planner_node,
     architect_node,
+    quality_gen_node,
     backend_lead_node,
     module_planner_node,
     module_coder_node,
@@ -13,58 +14,56 @@ from agents import (
     complete_module_node,
     qa_node,
     delivery_node,
+    project_init_node,
+    file_writer_node,
+    project_reader_node,
+    project_analyzer_node,
 )
 
 
-# ─── Conditional Routing Functions ───
+def route_by_mode(state: SoftwareState) -> Literal["planner", "project_reader"]:
+    mode = state.get("mode", "create_new")
+    if mode in ("analyze", "update"):
+        return "project_reader"
+    return "planner"
+
 
 def route_after_backend_lead(state: SoftwareState) -> Literal["module_planner", "qa"]:
-    """
-    If a module was assigned, go plan it.
-    If no modules remain, go to QA.
-    """
     if state.get("current_module"):
         return "module_planner"
     return "qa"
 
 
 def route_after_review(state: SoftwareState) -> Literal["fixer", "complete_module"]:
-    """
-    Three-way decision:
-      1. score >= threshold       → complete (pass)
-      2. attempts >= max_attempts → complete (force, prevent infinite loop)
-      3. otherwise                → fixer
-    """
+    threshold = state.get("review_threshold", 7)
     score = state.get("review_score", 0) or 0
     attempts = state.get("fix_attempts", 0)
     max_attempts = state.get("max_fix_attempts", 3)
-    threshold = 8
 
     if score >= threshold:
-        print(f"   ✓ Review PASSED (score={score}/{threshold}). Completing module.")
+        print(f"   Review PASSED (score={score}/{threshold}). Completing module.")
         return "complete_module"
 
     if attempts >= max_attempts:
         print(
-            f"   ⚠ Max fix attempts reached ({attempts}/{max_attempts}). "
+            f"   Max fix attempts reached ({attempts}/{max_attempts}). "
             f"Force-completing module (score={score})."
         )
         return "complete_module"
 
     print(
-        f"   ✗ Review FAILED (score={score}/{threshold}, "
+        f"   Review FAILED (score={score}/{threshold}, "
         f"attempts={attempts}/{max_attempts}). Sending to fixer."
     )
     return "fixer"
 
 
-# ─── Graph Construction ───
-
 workflow = StateGraph(SoftwareState)
 
-# Register all nodes
 workflow.add_node("planner", planner_node)
 workflow.add_node("architect", architect_node)
+workflow.add_node("quality_gen", quality_gen_node)
+workflow.add_node("project_init", project_init_node)
 workflow.add_node("backend_lead", backend_lead_node)
 workflow.add_node("module_planner", module_planner_node)
 workflow.add_node("module_coder", module_coder_node)
@@ -72,14 +71,27 @@ workflow.add_node("reviewer", reviewer_node)
 workflow.add_node("fixer", fixer_node)
 workflow.add_node("complete_module", complete_module_node)
 workflow.add_node("qa", qa_node)
+workflow.add_node("file_writer", file_writer_node)
 workflow.add_node("delivery", delivery_node)
+workflow.add_node("project_reader", project_reader_node)
+workflow.add_node("project_analyzer", project_analyzer_node)
 
-# Linear edges
-workflow.set_entry_point("planner")
+workflow.set_conditional_entry_point(
+    route_by_mode,
+    {
+        "planner": "planner",
+        "project_reader": "project_reader",
+    },
+)
+
+workflow.add_edge("project_reader", "project_analyzer")
+workflow.add_edge("project_analyzer", "planner")
+
 workflow.add_edge("planner", "architect")
-workflow.add_edge("architect", "backend_lead")
+workflow.add_edge("architect", "quality_gen")
+workflow.add_edge("quality_gen", "project_init")
+workflow.add_edge("project_init", "backend_lead")
 
-# Backend Lead dispatches: plan next module OR move to QA
 workflow.add_conditional_edges(
     "backend_lead",
     route_after_backend_lead,
@@ -89,11 +101,9 @@ workflow.add_conditional_edges(
     },
 )
 
-# Plan → Code → Review
 workflow.add_edge("module_planner", "module_coder")
 workflow.add_edge("module_coder", "reviewer")
 
-# Review → Fix (retry) OR Complete (pass/force)
 workflow.add_conditional_edges(
     "reviewer",
     route_after_review,
@@ -103,17 +113,12 @@ workflow.add_conditional_edges(
     },
 )
 
-# Fix → Review (loop back)
 workflow.add_edge("fixer", "reviewer")
-
-# Complete → Backend Lead (pick next module or finish)
 workflow.add_edge("complete_module", "backend_lead")
-
-# QA → Delivery → END
-workflow.add_edge("qa", "delivery")
+workflow.add_edge("qa", "file_writer")
+workflow.add_edge("file_writer", "delivery")
 workflow.add_edge("delivery", END)
 
-# ─── Compile with Checkpointing ───
 
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
