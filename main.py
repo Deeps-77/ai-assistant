@@ -1,4 +1,6 @@
+import os
 import sys
+import datetime
 from graph import app
 from state import SoftwareState
 from config import WorkflowConfig
@@ -15,11 +17,19 @@ def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
     return {
         "requirement": requirement,
         "mode": cfg.mode.value,
-        "tech_stack": cfg.tech_stack or "",
+        "tech_stack": cfg.tech_stack or None,
         "project_path": cfg.project_path,
         "output_dir": cfg.output_dir,
+        "run_dir": os.path.join(cfg.output_dir, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")),
         "max_fix_attempts": cfg.max_fix_attempts,
         "review_threshold": cfg.review_threshold,
+        "execution_mode": cfg.execution_mode,
+        "max_concurrent_modules": cfg.max_concurrent_modules,
+        "sandbox_enabled": cfg.sandbox_enabled,
+        "sandbox_mode": cfg.sandbox_mode,
+        "sandbox_docker_image": cfg.sandbox_docker_image,
+        "sandbox_stack": None,
+        "max_test_fix_attempts": cfg.max_test_fix_attempts,
         "provider": cfg.provider,
         "llm_base_url": cfg.llm_base_url,
         "llm_model": cfg.llm_model,
@@ -29,6 +39,7 @@ def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
         "quality_guide": None,
         "pending_modules": [],
         "completed_modules": [],
+        "batch_modules": [],
         "current_module": None,
         "module_plan": None,
         "generated_code": {},
@@ -40,6 +51,10 @@ def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
         "existing_code": {},
         "written_files": {},
         "delivery_package": None,
+        "sandbox_path": None,
+        "test_results": {},
+        "test_fix_attempts": 0,
+        "sandbox_cleanup_paths": [],
     }
 
 
@@ -64,14 +79,20 @@ def run_workflow(cfg: WorkflowConfig) -> SoftwareState:
         "recursion_limit": cfg.recursion_limit,
     }
 
+    run_dir = initial_state.get("run_dir", os.path.join(cfg.output_dir, "run"))
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"  Run Dir:      {run_dir}")
+
     print("=" * 60)
     print("AI SOFTWARE DELIVERY TEAM")
     print("=" * 60)
-    print(f"  Mode:        {cfg.mode.value}")
-    print(f"  Requirement: {cfg.requirement[:100] if cfg.requirement else '(none)'}")
-    print(f"  Project:     {cfg.project_path or '(will create)'}")
-    print(f"  Tech Stack:  {cfg.tech_stack or '(auto-detect)'}")
-    print(f"  LLM:         {cfg.llm_model}")
+    print(f"  Mode:          {cfg.mode.value}")
+    print(f"  Execution:     {cfg.execution_mode}")
+    print(f"  Concurrency:   {cfg.max_concurrent_modules}")
+    print(f"  Requirement:   {cfg.requirement[:100] if cfg.requirement else '(none)'}")
+    print(f"  Project:       {cfg.project_path or '(will create)'}")
+    print(f"  Tech Stack:    {cfg.tech_stack or '(auto-detect)'}")
+    print(f"  LLM:           {cfg.llm_model}")
     print(f"  Thread:      {cfg.thread_id}")
     print("=" * 60 + "\n")
 

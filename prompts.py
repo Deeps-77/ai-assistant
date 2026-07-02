@@ -153,6 +153,25 @@ def qa_prompt() -> ChatPromptTemplate:
     )
 
 
+def test_fixer_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_template(
+        "You are a QA engineer fixing failing tests for a {tech_stack} project.\n\n"
+        "Module: {module}\n\n"
+        "Generated code:\n{code}\n\n"
+        "Generated tests:\n{tests}\n\n"
+        "Test run output (failures/errors):\n{test_output}\n\n"
+        "Analyze the test failures and fix the ROOT CAUSE. You may fix:\n"
+        "1. The **code** (if it has bugs) — return the fixed code\n"
+        "2. The **tests** (if they have incorrect expectations) — return the fixed tests\n"
+        "3. Both, if needed\n\n"
+        "IMPORTANT: Return your output in this exact format:\n"
+        "# --- relative/path/to/file.ext ---\n"
+        "```\n...fixed code...\n```\n\n"
+        "Include ALL relevant files, not just the changed ones. "
+        "Prefix each file with its relative path header."
+    )
+
+
 def analyze_project_prompt() -> ChatPromptTemplate:
     return ChatPromptTemplate.from_template(
         "You are a senior software engineer analyzing an existing project.\n\n"

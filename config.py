@@ -25,9 +25,16 @@ class WorkflowConfig(BaseModel):
     max_fix_attempts: int = 3
     review_threshold: int = 7
     recursion_limit: int = 150
+    execution_mode: str = "parallel"                # "parallel" | "sequential"
+    max_concurrent_modules: int = 5
+
+    sandbox_enabled: bool = False
+    sandbox_mode: str = "local"                      # "local" | "docker"
+    sandbox_docker_image: Optional[str] = None        # Override docker image per stack
+    max_test_fix_attempts: int = 3
 
     provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama"))
-    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gemma3:12b-cloud"))
+    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", os.getenv("OLLAMA_MODEL", "gemma3:12b-cloud")))
     llm_base_url: str = Field(default_factory=lambda: os.getenv(
         "LLM_BASE_URL",
         os.getenv("OLLAMA_BASE_URL", "https://ollama.com"),
@@ -59,6 +66,18 @@ class WorkflowConfig(BaseModel):
         parser.add_argument("--max-fix-attempts", type=int, help="Max review-fix cycles per module")
         parser.add_argument("--review-threshold", type=int, help="Minimum score to pass review (1-10)")
         parser.add_argument("--recursion-limit", type=int, help="LangGraph recursion limit")
+        parser.add_argument("--execution-mode", choices=["parallel", "sequential"], default="parallel",
+                            help="Module execution mode: parallel (default) or sequential")
+        parser.add_argument("--max-concurrent-modules", type=int, default=5,
+                            help="Max modules to process concurrently in parallel mode (default: 5)")
+        parser.add_argument("--sandbox-enabled", action="store_true",
+                            help="Enable sandboxed test execution in isolated environment")
+        parser.add_argument("--sandbox-mode", choices=["local", "docker"], default="local",
+                            help="Sandbox isolation mode: local (temp dir) or docker (container)")
+        parser.add_argument("--sandbox-docker-image",
+                            help="Override default Docker image for the detected tech stack")
+        parser.add_argument("--max-test-fix-attempts", type=int,
+                            help="Max fix cycles when tests fail in sandbox (default: 3)")
         parser.add_argument("--provider", choices=["ollama", "lm_studio"], help="LLM provider")
         parser.add_argument("--llm-model", help="Model name")
         parser.add_argument("--llm-base-url", help="LLM API base URL")
