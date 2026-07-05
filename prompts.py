@@ -101,6 +101,7 @@ def module_coder_prompt() -> ChatPromptTemplate:
         "You MUST create these files with these exact paths:\n"
         "{exact_file_paths}\n\n"
         "Quality requirements (follow EVERY rule):\n{quality_guide}\n\n"
+        "Human feedback to incorporate (if any):\n{human_feedback}\n\n"
         "Return ONLY code inside markdown code blocks, one per file. "
         "Separate files with a header like:\n"
         "# --- exact/path/from/above/file.ext ---\n"
@@ -140,6 +141,7 @@ def fixer_prompt() -> ChatPromptTemplate:
         "Current code:\n{code}\n\n"
         "Issues to fix:\n{issues}\n\n"
         "Quality requirements (follow EVERY rule):\n{quality_guide}\n\n"
+        "Human feedback to incorporate (if any):\n{human_feedback}\n\n"
         "Return ONLY the corrected code in a markdown block."
     )
 

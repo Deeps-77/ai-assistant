@@ -47,6 +47,8 @@ def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
         "review_score": None,
         "review_issues": [],
         "fix_attempts": 0,
+        "human_approved": False,
+        "human_feedback": "",
         "existing_structure": None,
         "existing_code": {},
         "written_files": {},

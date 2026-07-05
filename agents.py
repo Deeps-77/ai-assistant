@@ -513,6 +513,7 @@ def module_coder_node(state: SoftwareState):
             "architecture": state["architecture"],
             "exact_file_paths": exact_file_paths,
             "quality_guide": state.get("quality_guide", ""),
+            "human_feedback": state.get("human_feedback", ""),
         })
     except Exception:
         print(f"   Module coder LLM call failed for [{module}]; using placeholder.")
@@ -632,6 +633,7 @@ def fixer_node(state: SoftwareState):
             "code": code,
             "issues": "\n".join(f"- {i}" for i in issues),
             "quality_guide": quality,
+            "human_feedback": state.get("human_feedback", ""),
         })
     except Exception:
         print(f"   Fixer LLM call failed for [{module}]; keeping original code.")
@@ -704,6 +706,49 @@ def complete_module_node(state: SoftwareState):
         "review_score": None,
         "review_issues": [],
         "fix_attempts": 0,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 7b — HUMAN REVIEW (Human-in-the-Loop)
+# ═══════════════════════════════════════════════
+
+
+def human_review_node(state: SoftwareState):
+
+    print("\n" + "=" * 60)
+    print("👤 HUMAN IN THE LOOP")
+    print("=" * 60)
+
+    print("\n📦 Completed Modules:")
+    for module in state.get("completed_modules", []):
+        print(f"✔ {module}")
+
+    print("\n📄 Generated Modules:")
+    for module in state.get("generated_code", {}).keys():
+        print(f"✔ {module}")
+
+    print(f"\n📝 Requirement:\n  {state.get('requirement', '')[:200]}")
+
+    choice = input("\nApprove Project? (yes/no): ").strip().lower()
+
+    feedback = ""
+
+    if choice == "no":
+        feedback = input("Enter feedback: ")
+
+        return {
+            "human_approved": False,
+            "human_feedback": feedback,
+            "completed_modules": [],
+            "generated_code": {},
+            "tests": {},
+            "pending_modules": state.get("modules", []),
+        }
+
+    return {
+        "human_approved": True,
+        "human_feedback": "",
     }
 
 
@@ -1188,6 +1233,8 @@ def _build_worker_payload(state: SoftwareState, module_name: str) -> WorkerState
         fix_attempts=0,
         max_fix_attempts=state.get("max_fix_attempts", 3),
         review_threshold=state.get("review_threshold", 7),
+        human_approved=state.get("human_approved", False),
+        human_feedback=state.get("human_feedback", ""),
         completed_modules=[],
     )
 
@@ -1250,6 +1297,7 @@ def worker_coder(state: WorkerState) -> dict:
             "architecture": state.get("architecture", ""),
             "exact_file_paths": exact_file_paths,
             "quality_guide": state.get("quality_guide", ""),
+            "human_feedback": state.get("human_feedback", ""),
         })
     except Exception:
         print(f"      * [{module}] Coder LLM call failed; using placeholder.")
@@ -1314,6 +1362,7 @@ def worker_fixer(state: WorkerState) -> dict:
             "code": code,
             "issues": "\n".join(f"- {i}" for i in issues),
             "quality_guide": state.get("quality_guide", ""),
+            "human_feedback": state.get("human_feedback", ""),
         })
     except Exception:
         print(f"      * [{module}] Fixer LLM call failed; keeping original code.")

@@ -13,6 +13,7 @@ from agents import (
     reviewer_node,
     fixer_node,
     complete_module_node,
+    human_review_node,
     qa_node,
     delivery_node,
     project_init_node,
@@ -43,10 +44,10 @@ def route_by_mode(state: SoftwareState) -> Literal["planner", "project_reader"]:
     return "planner"
 
 
-def route_after_backend_lead(state: SoftwareState) -> Literal["module_planner", "qa"]:
+def route_after_backend_lead(state: SoftwareState) -> Literal["module_planner", "human_review"]:
     if state.get("current_module"):
         return "module_planner"
-    return "qa"
+    return "human_review"
 
 
 def route_after_review(state: SoftwareState) -> Literal["fixer", "complete_module"]:
@@ -165,11 +166,11 @@ def _batch_sender_route(state: SoftwareState) -> list[Send]:
     ]
 
 
-def route_after_dispatcher(state: SoftwareState) -> Literal["batch_sender", "qa"]:
+def route_after_dispatcher(state: SoftwareState) -> Literal["batch_sender", "human_review"]:
     batch = state.get("batch_modules", [])
     if batch:
         return "batch_sender"
-    return "qa"
+    return "human_review"
 
 
 def batch_check_node(state: SoftwareState) -> dict:
@@ -184,11 +185,11 @@ def batch_check_node(state: SoftwareState) -> dict:
     return {}
 
 
-def route_after_batch_check(state: SoftwareState) -> Literal["dispatcher", "qa"]:
+def route_after_batch_check(state: SoftwareState) -> Literal["dispatcher", "human_review"]:
     pending = state.get("pending_modules", [])
     if pending:
         return "dispatcher"
-    return "qa"
+    return "human_review"
 
 
 # ─── PARALLEL SANDBOX DISPATCHER ────────────────────────────
@@ -218,6 +219,18 @@ def route_by_execution_mode(state: SoftwareState) -> Literal["dispatcher", "back
     return "backend_lead"
 
 
+def route_after_human(state: SoftwareState) -> Literal["qa", "dispatcher", "backend_lead"]:
+    if state.get("human_approved", False):
+        print("\n✅ Human Approved. Proceeding to QA...\n")
+        return "qa"
+
+    print("\n🔄 Human requested regeneration. Re-dispatching...\n")
+    execution_mode = state.get("execution_mode", "parallel")
+    if execution_mode == "parallel":
+        return "dispatcher"
+    return "backend_lead"
+
+
 # ─── MAIN GRAPH ──────────────────────────────────────────────
 
 workflow = StateGraph(SoftwareState)
@@ -239,7 +252,19 @@ workflow.add_node("batch_sender", lambda s: {})  # pass-through; routing handled
 workflow.add_node("worker_entry", worker_entry_node)
 workflow.add_node("batch_check", batch_check_node)  # fan-in after parallel batch
 
+workflow.add_node("human_review", human_review_node)
 workflow.add_node("qa", qa_node)
+
+# Human-in-the-loop routing
+workflow.add_conditional_edges(
+    "human_review",
+    route_after_human,
+    {
+        "qa": "qa",
+        "dispatcher": "dispatcher",
+        "backend_lead": "backend_lead",
+    },
+)
 
 workflow.add_node("sandbox_dispatcher", lambda s: {})  # pass-through; routing via _sandbox_route
 workflow.add_node("sandbox_worker_entry", sandbox_worker_node)
@@ -290,7 +315,7 @@ workflow.add_conditional_edges(
     route_after_dispatcher,
     {
         "batch_sender": "batch_sender",
-        "qa": "qa",
+        "human_review": "human_review",
     },
 )
 
@@ -307,7 +332,7 @@ workflow.add_conditional_edges(
     route_after_batch_check,
     {
         "dispatcher": "dispatcher",
-        "qa": "qa",
+        "human_review": "human_review",
     },
 )
 
@@ -318,7 +343,7 @@ workflow.add_conditional_edges(
     route_after_backend_lead,
     {
         "module_planner": "module_planner",
-        "qa": "qa",
+        "human_review": "human_review",
     },
 )
 

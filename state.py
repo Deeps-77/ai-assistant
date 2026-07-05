@@ -86,6 +86,9 @@ class WorkerState(TypedDict):
     max_fix_attempts: int
     review_threshold: int
 
+    human_approved: bool
+    human_feedback: str
+
     completed_modules: List[str]
 
 
@@ -148,6 +151,9 @@ class SoftwareState(TypedDict):
     review_score: Optional[int]
     review_issues: List[str]
     fix_attempts: int
+
+    human_approved: bool
+    human_feedback: str
 
     existing_structure: Optional[str]        # Tree string for analyze/update modes
     existing_code: Dict[str, str]            # rel_path -> content for existing project
