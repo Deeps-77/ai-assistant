@@ -1,5 +1,6 @@
 import time
 import random
+import types
 from typing import Any
 
 
@@ -10,12 +11,13 @@ def add_retry_to_llm(llm, max_retries: int = 2) -> Any:
     with exponential backoff + jitter. Logic errors (parsing, validation) are
     not retried — they propagate immediately.
 
-    This mutates the instance in-place so all derived runnables
-    (with_structured_output, prompt|llm, etc.) inherit the retry behavior.
+    Uses object.__setattr__ to bypass Pydantic v2's frozen attribute check
+    so derived runnables (with_structured_output, prompt|llm, etc.) inherit
+    the retry behavior.
     """
     original_invoke = llm.invoke
 
-    def retry_invoke(*args, **kwargs):
+    def retry_invoke(self, *args, **kwargs):
         last_exception = None
         for attempt in range(max_retries + 1):
             try:
@@ -34,5 +36,6 @@ def add_retry_to_llm(llm, max_retries: int = 2) -> Any:
                 raise
         raise last_exception
 
-    llm.invoke = retry_invoke
+    bound = types.MethodType(retry_invoke, llm)
+    object.__setattr__(llm, "invoke", bound)
     return llm
