@@ -64,6 +64,22 @@ def _append_list(a: List[str], b: List[str]) -> List[str]:
     return a + [x for x in b if x not in seen]
 
 
+def _append_int_list(a: List[int], b: List[int]) -> List[int]:
+    return a + b
+
+
+def _max_int(a: int, b: int) -> int:
+    return max(a, b)
+
+
+def _max_score(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
 # Per-worker state for the parallel execution subgraph
 
 class WorkerState(TypedDict):
@@ -77,6 +93,7 @@ class WorkerState(TypedDict):
     provider: str
     llm_base_url: str
     llm_model: str
+    max_retries: int
     module_plan: Optional[str]
     generated_code: Dict[str, str]
     tests: Dict[str, str]
@@ -84,6 +101,7 @@ class WorkerState(TypedDict):
     review_score: Optional[int]
     review_issues: List[str]
     fix_attempts: int
+    score_history: List[int]
     max_fix_attempts: int
     review_threshold: int
 
@@ -134,24 +152,26 @@ class SoftwareState(TypedDict):
     provider: str                            # "ollama" | "lm_studio"
     llm_base_url: str                        # API endpoint URL
     llm_model: str                           # Model identifier
+    max_retries: int                         # Max retries on transient LLM failures
 
     stories: List[str]
     architecture: Optional[str]
     modules: List[str]
     quality_guide: Optional[str]
 
-    pending_modules: List[str]
+    pending_modules: Annotated[List[str], _append_list]
     completed_modules: Annotated[List[str], _append_list]
-    batch_modules: List[str]                   # Current parallel batch being dispatched
+    batch_modules: Annotated[List[str], _append_list]  # Current parallel batch being dispatched
     current_module: Optional[str]
     module_plan: Optional[str]
 
     generated_code: Annotated[Dict[str, str], operator.or_]
     tests: Annotated[Dict[str, str], operator.or_]
 
-    review_score: Optional[int]
-    review_issues: List[str]
-    fix_attempts: int
+    review_score: Annotated[Optional[int], _max_score]
+    review_issues: Annotated[List[str], _append_list]
+    fix_attempts: Annotated[int, _max_int]
+    score_history: Annotated[List[int], _append_int_list]
 
     human_approved: bool
     human_feedback: str
@@ -168,6 +188,6 @@ class SoftwareState(TypedDict):
     sandbox_docker_image: Optional[str]      # Override Docker image
     sandbox_stack: Optional[str]             # Detected stack name
     test_results: Annotated[Dict[str, Any], operator.or_]  # module_name -> TestResult dict
-    test_fix_attempts: int
+    test_fix_attempts: Annotated[int, _max_int]
     max_test_fix_attempts: int
     sandbox_cleanup_paths: Annotated[List[str], _append_list]

@@ -55,17 +55,32 @@ def route_after_review(state: SoftwareState) -> Literal["fixer", "complete_modul
     score = state.get("review_score", 0) or 0
     attempts = state.get("fix_attempts", 0)
     max_attempts = state.get("max_fix_attempts", 3)
+    score_history = state.get("score_history", [])
 
     if score >= threshold:
         print(f"   Review PASSED (score={score}/{threshold}). Completing module.")
         return "complete_module"
 
     if attempts >= max_attempts:
-        print(
-            f"   Max fix attempts reached ({attempts}/{max_attempts}). "
-            f"Force-completing module (score={score})."
-        )
+        print(f"   Max fix attempts reached ({attempts}/{max_attempts}). "
+              f"Force-completing module (score={score}).")
         return "complete_module"
+
+    # Convergence detection: if score hasn't improved over last N reviews, break early
+    if len(score_history) >= 4:
+        # Compare best of last 2 vs best of 2 before that
+        recent = max(score_history[-2:])
+        prior = max(score_history[-4:-2])
+        if recent <= prior:
+            print(f"   No score improvement (recent: {score_history[-2:]}, prior: {score_history[-4:-2]}). "
+                  f"Converged — force-completing module (score={score}).")
+            return "complete_module"
+    elif len(score_history) == 3:
+        # If all 3 scores are identical and below threshold, converged
+        if len(set(score_history)) == 1:
+            print(f"   Score stuck at {score_history[0]} for 3 attempts. "
+                  f"Converged — force-completing module.")
+            return "complete_module"
 
     print(
         f"   Review FAILED (score={score}/{threshold}, "
@@ -81,6 +96,7 @@ def _route_after_worker_review(state: WorkerState) -> Literal["worker_fixer", "w
     attempts = state.get("fix_attempts", 0)
     max_att = state.get("max_fix_attempts", 3)
     threshold = state.get("review_threshold", 7)
+    score_history = state.get("score_history", [])
 
     if score >= threshold:
         print(f"      ✓  Score {score}/10 — PASS")
@@ -89,6 +105,13 @@ def _route_after_worker_review(state: WorkerState) -> Literal["worker_fixer", "w
     if attempts >= max_att:
         print(f"      ⚠  Max fix attempts ({attempts}/{max_att}) reached — force-complete")
         return "worker_complete"
+
+    # Convergence detection
+    if len(score_history) >= 3:
+        recent = score_history[-3:]
+        if len(set(recent)) == 1 and score < threshold:
+            print(f"      ✗ Score stuck at {recent[0]}, converged — force-complete")
+            return "worker_complete"
 
     print(f"      ✗ Score {score}/10, attempt {attempts}/{max_att} — RETRY")
     return "worker_fixer"

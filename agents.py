@@ -4,6 +4,7 @@ import re
 from typing import Any
 from langchain_core.exceptions import OutputParserException
 from dotenv import load_dotenv
+from resilience import add_retry_to_llm
 
 from state import (
     SoftwareState,
@@ -94,6 +95,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
     provider = state.get("provider", "ollama")
     base_url = state.get("llm_base_url", "https://ollama.com")
     model = state.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "gemma3:12b-cloud"
+    max_retries = int(state.get("max_retries", 2))
     cache_key = f"{provider}:{base_url}:{model}"
 
     if cache_key in _llm_cache:
@@ -105,6 +107,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(base_url=base_url, api_key="lm-studio",
                          model=model, temperature=0)
+        add_retry_to_llm(llm, max_retries=max_retries)
         result = {
             "llm": llm,
             "tool_llm": llm.bind_tools(tools),
@@ -117,6 +120,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
     else:
         from langchain_ollama import ChatOllama
         llm = ChatOllama(base_url=base_url, model=model, temperature=0)
+        add_retry_to_llm(llm, max_retries=max_retries)
         method = "json_mode"
         result = {
             "llm": llm,
@@ -720,9 +724,13 @@ def reviewer_node(state: SoftwareState):
     for issue in review.issues:
         print(f"     * {issue}")
 
+    score_hist = list(state.get("score_history", []))
+    score_hist.append(review.score)
+
     return {
         "review_score": review.score,
         "review_issues": review.issues,
+        "score_history": score_hist,
     }
 
 
@@ -868,6 +876,7 @@ def complete_module_node(state: SoftwareState):
         "review_score": None,
         "review_issues": [],
         "fix_attempts": 0,
+        "score_history": [],
     }
 
 
@@ -921,6 +930,16 @@ def human_review_node(state: SoftwareState):
 
 def qa_node(state: SoftwareState):
     tech_stack = state.get("tech_stack") or "Python/FastAPI"
+    execution_mode = state.get("execution_mode", "parallel")
+    sandbox_enabled = state.get("sandbox_enabled", False)
+
+    # In parallel+sandbox mode, tests are generated inside each
+    # sandbox_worker_node concurrently.  Only the sequential path
+    # needs tests generated here.
+    if execution_mode == "parallel" and sandbox_enabled:
+        print(f"--- QA AGENT: Tests deferred to parallel sandbox workers ---")
+        return {}
+
     print(f"--- QA AGENT: Generating Tests ({tech_stack}) ---")
     llms = _get_llms(state)
 
@@ -1533,7 +1552,10 @@ def worker_reviewer(state: WorkerState) -> dict:
     for iss in review.issues[:3]:
         print(f"        * {iss}")
 
-    return {"review_score": review.score, "review_issues": review.issues}
+    score_hist = list(state.get("score_history", []))
+    score_hist.append(review.score)
+
+    return {"review_score": review.score, "review_issues": review.issues, "score_history": score_hist}
 
 
 def worker_fixer(state: WorkerState) -> dict:
@@ -1754,6 +1776,22 @@ def sandbox_worker_node(state: SandboxWorkerState) -> dict:
 
     code_content = state.get("generated_code", {}).get(module, "")
     test_content = state.get("tests", {}).get(module, "")
+
+    # Generate tests on the fly if qa_node deferred them (parallel mode)
+    if not test_content and code_content:
+        print(f"   [sandbox] [{module}] Generating tests...")
+        llms = _get_llms(state)
+        from prompts import qa_prompt as _qa_prompt
+        try:
+            response = (_qa_prompt() | llms["llm"]).invoke({
+                "tech_stack": tech_stack,
+                "module": module,
+                "code": code_content,
+            })
+            test_content = response.content or ""
+        except Exception:
+            print(f"   [sandbox] [{module}] Test gen failed; using placeholder.")
+            test_content = f"# Tests for {module}\n# TODO: add tests\n"
 
     written: dict[str, str] = {}
 

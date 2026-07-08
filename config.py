@@ -24,9 +24,11 @@ class WorkflowConfig(BaseModel):
 
     max_fix_attempts: int = 3
     review_threshold: int = 7
+    adaptive_threshold: bool = True
     recursion_limit: int = 150
     execution_mode: str = "parallel"                # "parallel" | "sequential"
     max_concurrent_modules: int = 5
+    max_retries: int = 2
 
     sandbox_enabled: bool = False
     sandbox_mode: str = "local"                      # "local" | "docker"
@@ -65,11 +67,15 @@ class WorkflowConfig(BaseModel):
         parser.add_argument("--output-dir", default="outputs", help="Output directory")
         parser.add_argument("--max-fix-attempts", type=int, help="Max review-fix cycles per module")
         parser.add_argument("--review-threshold", type=int, help="Minimum score to pass review (1-10)")
+        parser.add_argument("--adaptive-threshold", action="store_true", default=None,
+                            help="Auto-lower threshold if all modules are force-completed")
         parser.add_argument("--recursion-limit", type=int, help="LangGraph recursion limit")
         parser.add_argument("--execution-mode", choices=["parallel", "sequential"], default="parallel",
                             help="Module execution mode: parallel (default) or sequential")
         parser.add_argument("--max-concurrent-modules", type=int, default=5,
                             help="Max modules to process concurrently in parallel mode (default: 5)")
+        parser.add_argument("--max-retries", type=int,
+                            help="Max LLM retries on transient failures (default: 2)")
         parser.add_argument("--sandbox-enabled", action="store_true",
                             help="Enable sandboxed test execution in isolated environment")
         parser.add_argument("--sandbox-mode", choices=["local", "docker"], default="local",
