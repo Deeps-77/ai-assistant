@@ -2,6 +2,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+from langchain_core.tools import tool
 
 
 def parse_folder_structure(structure_str: str) -> List[str]:
@@ -362,3 +363,43 @@ def extract_folder_structure_from_architecture(architecture: str) -> str:
             return m.group(1).strip()
 
     return ""
+
+
+@tool
+def write_file_tool(filepath: str, content: str) -> str:
+    """Write content to a file at the given path. Creates parent directories if missing.
+
+    Args:
+        filepath: Relative path to the file from the project root (e.g. "app/api/routes.py")
+        content: The full source code content to write into the file
+    """
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return f"Written: {filepath}"
+
+
+@tool
+def create_directory_tool(path: str) -> str:
+    """Create a directory and all necessary parent directories.
+
+    Args:
+        path: Directory path to create (e.g. "app/api")
+    """
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return f"Created: {path}/"
+
+
+@tool
+def read_file_tool(filepath: str) -> str:
+    """Read and return the contents of a file.
+
+    Args:
+        filepath: Path to the file to read
+    """
+    try:
+        return Path(filepath).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"Error: file not found: {filepath}"
+    except Exception as e:
+        return f"Error reading {filepath}: {e}"

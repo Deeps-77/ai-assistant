@@ -102,11 +102,10 @@ def module_coder_prompt() -> ChatPromptTemplate:
         "{exact_file_paths}\n\n"
         "Quality requirements (follow EVERY rule):\n{quality_guide}\n\n"
         "Human feedback to incorporate (if any):\n{human_feedback}\n\n"
-        "Return ONLY code inside markdown code blocks, one per file. "
-        "Separate files with a header like:\n"
-        "# --- exact/path/from/above/file.ext ---\n"
-        "```\n...code...\n```\n"
-        "DO NOT add any files not listed. DO NOT change the paths."
+        "IMPORTANT: You have access to file-writing tools. Use them directly:\n"
+        "1. First call `create_directory_tool` for any needed directories.\n"
+        "2. Then call `write_file_tool` for each file with its exact path and full content.\n"
+        "Create every file listed above. Do NOT skip any file."
     )
 
 
@@ -142,7 +141,10 @@ def fixer_prompt() -> ChatPromptTemplate:
         "Issues to fix:\n{issues}\n\n"
         "Quality requirements (follow EVERY rule):\n{quality_guide}\n\n"
         "Human feedback to incorporate (if any):\n{human_feedback}\n\n"
-        "Return ONLY the corrected code in a markdown block."
+        "IMPORTANT: You have access to file-writing tools. Use them directly:\n"
+        "1. Call `write_file_tool` for each file you need to rewrite with fixes.\n"
+        "2. Use the exact same file paths as the original code.\n"
+        "Write every corrected file — do not skip any."
     )
 
 

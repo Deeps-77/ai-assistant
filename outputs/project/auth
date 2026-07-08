@@ -1,0 +1,89 @@
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+from app.models.user import UserCreate, User
+from app.models.token import Token
+from app.dependencies.get_db import db_dependency
+from app.services.user_service import create_user, authenticate_user
+from unittest.mock import patch, MagicMock
+
+# Initialize test client
+client = TestClient(app)
+
+# Mock the database session for testing
+def mock_db_session():
+    return MagicMock()
+
+# Patch get_db to use a mock session
+@pytest.fixture(autouse=True)
+def mock_get_db():
+    with patch('app.dependencies.get_db.get_db', return_value=mock_db_session()):
+        yield
+
+# Mock user_service functions
+@patch('app.services.user_service.create_user')
+@patch('app.services.user_service.authenticate_user')
+def test_register_user_success(mock_authenticate, mock_create):
+    # Setup mocks
+    mock_create.return_value = User(id=1, username="testuser", email="test@example.com", hashed_password="hashedpassword")
+    mock_authenticate.return_value = None
+
+    response = client.post("/api/v1/auth/register", json={"username": "testuser", "email": "test@example.com", "password": "password"})
+    assert response.status_code == 200
+    token_data = response.json()
+    assert token_data["access_token"] == "1"
+    assert token_data["token_type"] == "bearer"
+
+def test_register_user_duplicate_username(mock_db_session):
+    # Setup mocks for duplicate username
+    mock_db_session.query.return_value.filter.return_value.first.return_value = User(username="testuser")
+    
+    response = client.post("/api/v1/auth/register", json={"username": "testuser", "email": "test@example.com", "password": "password"})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Username already exists"
+
+def test_register_user_duplicate_email(mock_db_session):
+    # Setup mocks for duplicate email
+    mock_db_session.query.return_value.filter.return_value.first.return_value = User(email="test@example.com")
+    
+    response = client.post("/api/v1/auth/register", json={"username": "newuser", "email": "test@example.com", "password": "password"})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Email already exists"
+
+@patch('app.services.user_service.create_user')
+def test_login_user_success(mock_create):
+    # Setup mock for successful authentication
+    mock_create.return_value = User(id=1, username="testuser", email="test@example.com", hashed_password="hashedpassword")
+    
+    response = client.post("/api/v1/auth/login", json={"username": "testuser", "email": "test@example.com", "password": "password"})
+    assert response.status_code == 200
+    token_data = response.json()
+    assert token_data["access_token"] == "1"
+    assert token_data["token_type"] == "bearer"
+
+@patch('app.services.user_service.create_user')
+def test_login_user_invalid_password(mock_create):
+    # Setup mock for invalid password
+    mock_create.return_value = User(id=1, username="testuser", email="test@example.com", hashed_password="hashedpassword")
+    
+    response = client.post("/api/v1/auth/login", json={"username": "testuser", "email": "test@example.com", "password": "wrongpassword"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid credentials"
+
+@patch('app.services.user_service.create_user')
+def test_login_user_non_existent_user(mock_create):
+    # Setup mock for non-existent user
+    mock_create.return_value = None
+    
+    response = client.post("/api/v1/auth/login", json={"username": "nonexistent", "email": "nonexistent@example.com", "password": "password"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid credentials"
+
+def test_get_current_user(mock_db_session):
+    # Test that the dependency is called with a valid token
+    response = client.get("/api/v1/auth/me")
+    assert response.status_code == 200
+    user_data = response.json()
+    assert user_data["id"] == 1
+    assert user_data["username"] == "testuser"
+    assert user_data["email"] == "test@example.com"

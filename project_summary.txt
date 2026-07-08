@@ -1,0 +1,1614 @@
+=== PROJECT CODE DUMP ===
+Generated on: ai-assistant
+=========================
+
+// ========== START OF FILE: graph.py ==========
+from typing import Literal
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from state import SoftwareState
+from agents import (
+    planner_node,
+    architect_node,
+    quality_gen_node,
+    backend_lead_node,
+    module_planner_node,
+    module_coder_node,
+    reviewer_node,
+    fixer_node,
+    complete_module_node,
+    qa_node,
+    delivery_node,
+    project_init_node,
+    file_writer_node,
+    project_reader_node,
+    project_analyzer_node,
+)
+
+
+def route_by_mode(state: SoftwareState) -> Literal["planner", "project_reader"]:
+    mode = state.get("mode", "create_new")
+    if mode in ("analyze", "update"):
+        return "project_reader"
+    return "planner"
+
+
+def route_after_backend_lead(state: SoftwareState) -> Literal["module_planner", "qa"]:
+    if state.get("current_module"):
+        return "module_planner"
+    return "qa"
+
+
+def route_after_review(state: SoftwareState) -> Literal["fixer", "complete_module"]:
+    threshold = state.get("review_threshold", 7)
+    score = state.get("review_score", 0) or 0
+    attempts = state.get("fix_attempts", 0)
+    max_attempts = state.get("max_fix_attempts", 3)
+
+    if score >= threshold:
+        print(f"   Review PASSED (score={score}/{threshold}). Completing module.")
+        return "complete_module"
+
+    if attempts >= max_attempts:
+        print(
+            f"   Max fix attempts reached ({attempts}/{max_attempts}). "
+            f"Force-completing module (score={score})."
+        )
+        return "complete_module"
+
+    print(
+        f"   Review FAILED (score={score}/{threshold}, "
+        f"attempts={attempts}/{max_attempts}). Sending to fixer."
+    )
+    return "fixer"
+
+
+workflow = StateGraph(SoftwareState)
+
+workflow.add_node("planner", planner_node)
+workflow.add_node("architect", architect_node)
+workflow.add_node("quality_gen", quality_gen_node)
+workflow.add_node("project_init", project_init_node)
+workflow.add_node("backend_lead", backend_lead_node)
+workflow.add_node("module_planner", module_planner_node)
+workflow.add_node("module_coder", module_coder_node)
+workflow.add_node("reviewer", reviewer_node)
+workflow.add_node("fixer", fixer_node)
+workflow.add_node("complete_module", complete_module_node)
+workflow.add_node("qa", qa_node)
+workflow.add_node("file_writer", file_writer_node)
+workflow.add_node("delivery", delivery_node)
+workflow.add_node("project_reader", project_reader_node)
+workflow.add_node("project_analyzer", project_analyzer_node)
+
+workflow.set_conditional_entry_point(
+    route_by_mode,
+    {
+        "planner": "planner",
+        "project_reader": "project_reader",
+    },
+)
+
+workflow.add_edge("project_reader", "project_analyzer")
+workflow.add_edge("project_analyzer", "planner")
+
+workflow.add_edge("planner", "architect")
+workflow.add_edge("architect", "quality_gen")
+workflow.add_edge("quality_gen", "project_init")
+workflow.add_edge("project_init", "backend_lead")
+
+workflow.add_conditional_edges(
+    "backend_lead",
+    route_after_backend_lead,
+    {
+        "module_planner": "module_planner",
+        "qa": "qa",
+    },
+)
+
+workflow.add_edge("module_planner", "module_coder")
+workflow.add_edge("module_coder", "reviewer")
+
+workflow.add_conditional_edges(
+    "reviewer",
+    route_after_review,
+    {
+        "fixer": "fixer",
+        "complete_module": "complete_module",
+    },
+)
+
+workflow.add_edge("fixer", "reviewer")
+workflow.add_edge("complete_module", "backend_lead")
+workflow.add_edge("qa", "file_writer")
+workflow.add_edge("file_writer", "delivery")
+workflow.add_edge("delivery", END)
+
+
+memory = MemorySaver()
+app = workflow.compile(checkpointer=memory)
+
+// ========== END OF FILE: graph.py ==========
+
+
+// ========== START OF FILE: agents.py ==========
+import os
+import json
+from typing import Any
+from langchain_core.exceptions import OutputParserException
+from dotenv import load_dotenv
+
+from state import (
+    SoftwareState,
+    ModuleList,
+    ArchitectureDoc,
+    ModulePlan,
+    ModuleFile,
+    CodeReview,
+    ProjectAnalysis,
+)
+from prompts import (
+    planner_prompt,
+    planner_fallback_prompt,
+    architect_prompt,
+    architect_fallback_prompt,
+    quality_guide_prompt,
+    module_planner_prompt,
+    module_planner_fallback_prompt,
+    module_coder_prompt,
+    reviewer_prompt,
+    reviewer_fallback_prompt,
+    fixer_prompt,
+    qa_prompt,
+    analyze_project_prompt,
+)
+from file_tools import (
+    extract_folder_structure_from_architecture,
+    init_project_structure,
+    ensure_directory,
+    write_module_files,
+    write_test_files,
+    read_project_structure,
+    read_project_files,
+    parse_code_blocks,
+)
+
+load_dotenv()
+
+_llm_cache: dict = {}
+
+
+def _get_llms(state: SoftwareState) -> dict[str, Any]:
+    provider = state.get("provider", "ollama")
+    base_url = state.get("llm_base_url", "https://ollama.com")
+    model = state.get("llm_model", "gemma3:12b-cloud")
+    cache_key = f"{provider}:{base_url}:{model}"
+
+    if cache_key in _llm_cache:
+        return _llm_cache[cache_key]
+
+    if provider == "lm_studio":
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(base_url=base_url, api_key="lm-studio",
+                         model=model, temperature=0)
+        method = "json_schema"
+    else:
+        from langchain_ollama import ChatOllama
+        llm = ChatOllama(base_url=base_url, model=model, temperature=0)
+        method = "json_mode"
+
+    result = {
+        "llm": llm,
+        "planner": llm.with_structured_output(ModuleList, method=method),
+        "architect": llm.with_structured_output(ArchitectureDoc, method=method),
+        "module_planner": llm.with_structured_output(ModulePlan, method=method),
+        "reviewer": llm.with_structured_output(CodeReview, method=method),
+        "analyzer": llm.with_structured_output(ProjectAnalysis, method=method),
+    }
+    _llm_cache[cache_key] = result
+    return result
+
+# ═══════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════
+
+
+def _dict_to_str(val) -> str:
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return "\n".join(f"- {_dict_to_str(v)}" for v in val)
+    if isinstance(val, dict):
+        return "\n".join(f"{k}: {_dict_to_str(v)}" for k, v in val.items())
+    return str(val)
+
+
+def _flatten_planner(raw: dict) -> ModuleList:
+    stories = raw.get("stories") or raw.get("user_stories") or []
+    modules = raw.get("modules") or raw.get("backend_modules") or raw.get("module_names") or []
+    tech_stack = raw.get("tech_stack") or raw.get("stack") or raw.get("technology_stack") or ""
+    return ModuleList(
+        stories=[str(s) for s in stories],
+        modules=[str(m) for m in modules],
+        tech_stack=str(tech_stack),
+    )
+
+
+def _flatten_architecture(raw: dict) -> ArchitectureDoc:
+    inner = raw
+    for wrapper in ("system_architecture", "architecture", "arch"):
+        if wrapper in raw and isinstance(raw[wrapper], dict):
+            inner = raw[wrapper]
+            break
+
+    return ArchitectureDoc(
+        tech_stack=_dict_to_str(inner.get("tech_stack", "")),
+        db_schema=_dict_to_str(inner.get("db_schema", "")),
+        api_endpoints=_dict_to_str(inner.get("api_endpoints", "")),
+        folder_structure=_dict_to_str(inner.get("folder_structure", "")),
+        architecture_diagram=_dict_to_str(inner.get("architecture_diagram", "")),
+    )
+
+
+def _flatten_module_plan(raw: dict) -> ModulePlan:
+    name = raw.get("module_name") or raw.get("name") or ""
+    files_raw = raw.get("files") or []
+    files = []
+    for f in files_raw:
+        if isinstance(f, dict):
+            exports_raw = f.get("exports") or []
+            files.append(ModuleFile(
+                path=f.get("path", ""),
+                purpose=f.get("purpose", ""),
+                exports=[str(e) for e in exports_raw],
+            ))
+    deps = raw.get("dependencies") or raw.get("deps") or []
+    routes = raw.get("api_routes") or raw.get("routes") or []
+    return ModulePlan(
+        module_name=name,
+        files=files,
+        dependencies=[str(d) for d in deps],
+        api_routes=[str(r) for r in routes],
+    )
+
+
+def _flatten_review(raw: dict) -> CodeReview:
+    score = raw.get("score") or raw.get("quality_score") or 0
+    if isinstance(score, str):
+        score = int(score)
+
+    issues_raw = raw.get("issues") or []
+    issues = []
+    for i in issues_raw:
+        if isinstance(i, str):
+            issues.append(i)
+        elif isinstance(i, dict):
+            issues.append(i.get("description") or i.get("message") or str(i))
+        else:
+            issues.append(str(i))
+
+    logic = raw.get("logic_correctness") or raw.get("logic_correctness_analysis") or ""
+    if isinstance(logic, dict):
+        logic = _dict_to_str(logic)
+
+    security = raw.get("security_check") or raw.get("security_analysis") or ""
+    if isinstance(security, dict):
+        security = _dict_to_str(security)
+
+    return CodeReview(score=score, issues=issues, logic_correctness=logic, security_check=security)
+
+
+# ═══════════════════════════════════════════════
+# NODE 1 — PLANNER
+# ═══════════════════════════════════════════════
+
+
+def planner_node(state: SoftwareState):
+    print("--- PLANNER: Analyzing Requirements ---")
+    llms = _get_llms(state)
+
+    prompt = planner_prompt()
+    chain = prompt | llms["planner"]
+
+    try:
+        result: ModuleList = chain.invoke({"requirement": state["requirement"]})
+    except OutputParserException:
+        print("   Planner JSON parse failed; attempting fallback...")
+        raw_response = llms["llm"].invoke(
+            planner_fallback_prompt().format(requirement=state["requirement"])
+        )
+        try:
+            raw_dict = json.loads(raw_response.content)
+        except json.JSONDecodeError:
+            print("   Planner fallback also failed; using safe defaults.")
+            return {
+                "stories": [f"Implement {state['requirement']}"],
+                "modules": ["app"],
+                "tech_stack": state.get("tech_stack", "Python/FastAPI"),
+                "pending_modules": ["app"],
+                "completed_modules": [],
+                "max_fix_attempts": state.get("max_fix_attempts", 3),
+                "review_threshold": state.get("review_threshold", 7),
+            }
+        result = _flatten_planner(raw_dict)
+
+    clean_modules = []
+    for m in result.modules:
+        if isinstance(m, str):
+            clean_modules.append(m)
+        elif isinstance(m, dict):
+            clean_modules.append(m.get("name", str(m)))
+        else:
+            clean_modules.append(str(m))
+
+    tech_stack = state.get("tech_stack") or result.tech_stack or "Python/FastAPI"
+
+    print(f"   Stories: {len(result.stories)} | Modules: {clean_modules} | Stack: {tech_stack}")
+
+    return {
+        "stories": result.stories,
+        "modules": clean_modules,
+        "tech_stack": tech_stack,
+        "pending_modules": clean_modules,
+        "completed_modules": [],
+        "max_fix_attempts": state.get("max_fix_attempts", 3),
+        "review_threshold": state.get("review_threshold", 7),
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 2 — ARCHITECT
+# ═══════════════════════════════════════════════
+
+
+def architect_node(state: SoftwareState):
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- ARCHITECT: Designing System ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    prompt = architect_prompt()
+    chain = prompt | llms["architect"]
+
+    try:
+        doc: ArchitectureDoc = chain.invoke({
+            "tech_stack": tech_stack,
+            "stories": state["stories"],
+            "modules": state["modules"],
+        })
+    except OutputParserException:
+        print("   Architect JSON parse failed; attempting fallback...")
+        raw_response = llms["llm"].invoke(
+            architect_fallback_prompt().format(
+                tech_stack=tech_stack,
+                stories=state["stories"],
+                modules=state["modules"],
+            )
+        )
+        try:
+            raw_dict = json.loads(raw_response.content)
+        except json.JSONDecodeError:
+            print("   Architect fallback also failed; using safe defaults.")
+            raw_dict = {}
+        doc = _flatten_architecture(raw_dict)
+
+    arch_str = f"""# Architecture Document
+
+## Tech Stack
+{doc.tech_stack}
+
+## Database Schema
+{doc.db_schema}
+
+## API Endpoints
+{doc.api_endpoints}
+
+## Folder Structure
+{doc.folder_structure}
+
+## Architecture Diagram
+{doc.architecture_diagram}
+"""
+    print(f"   Tech stack: {doc.tech_stack}")
+    return {"architecture": arch_str}
+
+
+# ═══════════════════════════════════════════════
+# NODE 2b — QUALITY GUIDE GENERATOR
+# ═══════════════════════════════════════════════
+
+
+def quality_gen_node(state: SoftwareState):
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- QUALITY: Generating quality guide for {tech_stack} ---")
+    llms = _get_llms(state)
+
+    chain = quality_guide_prompt() | llms["llm"]
+    response = chain.invoke({"tech_stack": tech_stack})
+
+    guide = response.content or ""
+    if not guide.strip():
+        guide = f"# Quality Guide for {tech_stack}\n- Follow best practices for {tech_stack}\n"
+        print("   Quality guide empty; using fallback.")
+
+    print(f"   Quality guide generated ({len(guide)} chars)")
+    return {"quality_guide": guide}
+
+
+# ═══════════════════════════════════════════════
+# NODE 2c — PROJECT INIT
+# ═══════════════════════════════════════════════
+
+
+def project_init_node(state: SoftwareState):
+    project_path = state.get("project_path") or os.path.join(
+        state.get("output_dir", "outputs"), "project"
+    )
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- INIT: Creating project skeleton at {project_path} ---")
+
+    folder_structure = extract_folder_structure_from_architecture(
+        state.get("architecture", "")
+    )
+
+    if folder_structure:
+        print("   Creating directory structure from architecture...")
+        init_project_structure(project_path, folder_structure)
+    else:
+        print("   No folder structure in architecture; creating minimal directories.")
+        ensure_directory(project_path)
+
+    return {"project_path": project_path}
+
+
+# ═══════════════════════════════════════════════
+# NODE 3 — BACKEND LEAD (Dispatcher)
+# ═══════════════════════════════════════════════
+
+
+def backend_lead_node(state: SoftwareState):
+    print("--- BACKEND LEAD: Assigning Work ---")
+
+    pending = list(state.get("pending_modules", []))
+
+    if not pending:
+        print("   No pending modules remaining.")
+        return {"current_module": None}
+
+    next_module = pending[0]
+    new_pending = pending[1:]
+
+    if isinstance(next_module, dict):
+        next_module = next_module.get("name", str(next_module))
+
+    print(f"   Assigning: {next_module}  (remaining: {len(new_pending)})")
+
+    return {
+        "current_module": next_module,
+        "pending_modules": new_pending,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 4a — MODULE PLANNER
+# ═══════════════════════════════════════════════
+
+
+def module_planner_node(state: SoftwareState):
+    module = state["current_module"]
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- MODULE PLANNER: Planning [{module}] ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    prompt = module_planner_prompt()
+    chain = prompt | llms["module_planner"]
+    quality = state.get("quality_guide", "")
+
+    try:
+        plan: ModulePlan = chain.invoke({
+            "tech_stack": tech_stack,
+            "module": module,
+            "architecture": state["architecture"],
+            "quality_guide": quality,
+        })
+    except OutputParserException:
+        print("   Module planner JSON parse failed; attempting fallback...")
+        raw_response = llms["llm"].invoke(
+            module_planner_fallback_prompt().format(module=module, architecture=state.get("architecture", ""))
+        )
+        try:
+            raw_dict = json.loads(raw_response.content)
+        except json.JSONDecodeError:
+            print("   Module planner fallback also failed; using empty plan.")
+            raw_dict = {}
+        plan = _flatten_module_plan(raw_dict)
+
+    plan_lines = [f"## Plan for {plan.module_name}"]
+    plan_lines.append(f"\n### Files:")
+    for f in plan.files:
+        exports = ", ".join(f.exports) if hasattr(f, "exports") and f.exports else ""
+        plan_lines.append(f"- {f.path}: {f.purpose} [{exports}]")
+    plan_lines.append(f"\n### Dependencies: {', '.join(plan.dependencies)}")
+    plan_lines.append(f"\n### API Routes:")
+    for r in plan.api_routes:
+        plan_lines.append(f"- {r}")
+
+    return {"module_plan": "\n".join(plan_lines)}
+
+
+# ═══════════════════════════════════════════════
+# NODE 4b — MODULE CODER
+# ═══════════════════════════════════════════════
+
+
+def _extract_paths_from_plan(module_plan: str) -> list[str]:
+    paths: list[str] = []
+    for line in module_plan.split("\n"):
+        line = line.strip()
+        if line.startswith("- ") and ":" in line:
+            path = line[2:].split(":")[0].strip()
+            if path and (path.endswith(".py") or "." in path):
+                paths.append(path)
+    return paths
+
+
+def module_coder_node(state: SoftwareState):
+    module = state["current_module"]
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- MODULE CODER: Coding [{module}] ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    module_plan = state.get("module_plan", "")
+    planned_paths = _extract_paths_from_plan(module_plan)
+    exact_file_paths = "\n".join(f"  - {p}" for p in planned_paths) if planned_paths else module_plan
+
+    prompt = module_coder_prompt()
+    chain = prompt | llms["llm"]
+    response = chain.invoke({
+        "tech_stack": tech_stack,
+        "module": module,
+        "architecture": state["architecture"],
+        "exact_file_paths": exact_file_paths,
+        "quality_guide": state.get("quality_guide", ""),
+    })
+
+    content = response.content or ""
+    if not content.strip():
+        print(f"   Empty response for [{module}]; generating placeholder.")
+        content = f"# {module} module\n# TODO: implement\n"
+
+    code_map = dict(state.get("generated_code", {}))
+    code_map[module] = content
+
+    generated_paths = list(parse_code_blocks(content).keys())
+    if planned_paths and generated_paths:
+        missing = [p for p in planned_paths if p not in generated_paths]
+        extra = [p for p in generated_paths if p not in planned_paths]
+        if missing:
+            print(f"   WARNING: {len(missing)} planned files missing from output:")
+            for p in missing:
+                print(f"     MISSING: {p}")
+        if extra:
+            print(f"   WARNING: {len(extra)} unexpected files in output:")
+            for p in extra:
+                print(f"     EXTRA: {p}")
+        if missing or extra:
+            print(f"   Planned: {planned_paths}")
+            print(f"   Generated: {generated_paths}")
+
+    return {
+        "generated_code": code_map,
+        "fix_attempts": 0,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 5 — REVIEWER
+# ═══════════════════════════════════════════════
+
+
+def reviewer_node(state: SoftwareState):
+    module = state["current_module"]
+    code = state["generated_code"].get(module, "")
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- REVIEWER: Reviewing [{module}] ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    if not code:
+        print(f"   No code found for [{module}]; returning failing review.")
+        return {
+            "review_score": 1,
+            "review_issues": [f"No code generated for module '{module}'"],
+        }
+
+    prompt = reviewer_prompt()
+    chain = prompt | llms["reviewer"]
+
+    try:
+        review: CodeReview = chain.invoke({
+            "tech_stack": tech_stack,
+            "module": module,
+            "code": code,
+        })
+    except OutputParserException:
+        print("   Review JSON parse failed; attempting fallback...")
+        raw_response = llms["llm"].invoke(
+            reviewer_fallback_prompt().format(tech_stack=tech_stack, module=module, code=code)
+        )
+        try:
+            raw_dict = json.loads(raw_response.content)
+        except json.JSONDecodeError:
+            print("   Review fallback also failed; using safe defaults.")
+            raw_dict = {}
+        review = _flatten_review(raw_dict)
+
+    print(f"   Score: {review.score}/10 | Issues: {len(review.issues)}")
+    for issue in review.issues:
+        print(f"     * {issue}")
+
+    return {
+        "review_score": review.score,
+        "review_issues": review.issues,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 6 — FIXER
+# ═══════════════════════════════════════════════
+
+
+def fixer_node(state: SoftwareState):
+    module = state["current_module"]
+    code = state["generated_code"].get(module, "")
+    issues = state.get("review_issues", [])
+    attempts = state.get("fix_attempts", 0) + 1
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+
+    print(f"--- FIXER: Fixing [{module}] (attempt {attempts}) ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    quality = state.get("quality_guide", "")
+
+    prompt = fixer_prompt()
+    chain = prompt | llms["llm"]
+    response = chain.invoke({
+        "tech_stack": tech_stack,
+        "module": module,
+        "code": code,
+        "issues": "\n".join(f"- {i}" for i in issues),
+        "quality_guide": quality,
+    })
+
+    code_map = dict(state["generated_code"])
+    code_map[module] = response.content
+
+    return {
+        "generated_code": code_map,
+        "fix_attempts": attempts,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 7 — COMPLETE MODULE
+# ═══════════════════════════════════════════════
+
+
+def _rebuild_project_dirs(state: SoftwareState) -> None:
+    project_path = state.get("project_path", "")
+    if not project_path:
+        return
+
+    arch_structure = extract_folder_structure_from_architecture(
+        state.get("architecture", "")
+    )
+
+    actual_dirs: set[str] = set()
+    for module_code in state.get("generated_code", {}).values():
+        for file_path in parse_code_blocks(module_code):
+            parts = file_path.replace("\\", "/").split("/")
+            for i in range(1, len(parts)):
+                actual_dirs.add("/".join(parts[:i]))
+
+    if actual_dirs:
+        merged = "\n".join(
+            f"{d}/" if not d.startswith(".") else d
+            for d in sorted(actual_dirs | set(
+                d for d in [
+                    l.strip("- ").split(":")[0].strip()
+                    for l in arch_structure.split("\n")
+                    if l.strip().startswith("- ") and "/" in l
+                ] if d
+            ))
+        )
+        init_project_structure(project_path, merged)
+
+
+def complete_module_node(state: SoftwareState):
+    module = state["current_module"]
+    print(f"--- COMPLETE: Marking [{module}] as done ---")
+
+    completed = list(state.get("completed_modules", []))
+    if module and module not in completed:
+        completed.append(module)
+
+    print(f"   Completed so far: {completed}")
+
+    _rebuild_project_dirs(state)
+
+    return {
+        "completed_modules": completed,
+        "current_module": None,
+        "module_plan": None,
+        "review_score": None,
+        "review_issues": [],
+        "fix_attempts": 0,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 8 — QA AGENT
+# ═══════════════════════════════════════════════
+
+
+def qa_node(state: SoftwareState):
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+    print(f"--- QA AGENT: Generating Tests ({tech_stack}) ---")
+    llms = _get_llms(state)
+
+    tests: dict[str, str] = {}
+
+    for module, code in state["generated_code"].items():
+        print(f"   Generating tests for [{module}]...")
+
+        prompt = qa_prompt()
+        chain = prompt | llms["llm"]
+        response = chain.invoke({
+            "tech_stack": tech_stack,
+            "module": module,
+            "code": code,
+        })
+        tests[module] = response.content
+
+    print(f"   Tests generated for {len(tests)} modules.")
+    return {"tests": tests}
+
+
+# ═══════════════════════════════════════════════
+# NODE 8b — FILE WRITER
+# ═══════════════════════════════════════════════
+
+
+def file_writer_node(state: SoftwareState):
+    project_path = state.get("project_path", "")
+    if not project_path:
+        print("   No project_path set. Skipping file writes.")
+        return {}
+
+    print(f"--- FILE WRITER: Writing code to {project_path} ---")
+    written: dict[str, str] = {}
+
+    for module, code in state.get("generated_code", {}).items():
+        results = write_module_files(project_path, module, code,
+                                     state.get("architecture", ""))
+        written.update(results)
+
+    test_results = write_test_files(project_path, state.get("tests", {}))
+    written.update(test_results)
+
+    ok_count = sum(1 for v in written.values() if v == "ok")
+    error_count = sum(1 for v in written.values() if v != "ok")
+    print(f"   Files written: {ok_count} ok, {error_count} errors")
+
+    return {"written_files": written}
+
+
+# ═══════════════════════════════════════════════
+# NODE 9 — DELIVERY PACKAGE
+# ═══════════════════════════════════════════════
+
+
+def delivery_node(state: SoftwareState):
+    print("--- DELIVERY: Compiling Package ---")
+
+    tech_stack = state.get("tech_stack", "Python/FastAPI")
+
+    sections = []
+    sections.append("# ═══════════════════════════════════════════")
+    sections.append("# SOFTWARE DELIVERY PACKAGE")
+    sections.append("# ═══════════════════════════════════════════\n")
+
+    sections.append("## Requirement\n")
+    sections.append(state["requirement"])
+
+    sections.append(f"\n## Tech Stack\n{tech_stack}")
+
+    sections.append("\n## User Stories\n")
+    for s in state.get("stories", []):
+        sections.append(f"- {s}")
+
+    sections.append("\n## Completed Modules\n")
+    for m in state.get("completed_modules", []):
+        sections.append(f"- {m}")
+
+    sections.append(f"\n## Architecture\n")
+    sections.append(state.get("architecture", "N/A"))
+
+    if state.get("written_files"):
+        sections.append("\n## Written Files\n")
+        for path, status in state.get("written_files", {}).items():
+            sections.append(f"- {path} [{status}]")
+
+    sections.append("\n\n## ═══ SOURCE CODE ═══\n")
+    for module, code in state.get("generated_code", {}).items():
+        sections.append(f"\n### Module: {module}\n")
+        sections.append(code)
+
+    sections.append("\n\n## ═══ TEST CODE ═══\n")
+    for module, test in state.get("tests", {}).items():
+        sections.append(f"\n### Tests: {module}\n")
+        sections.append(test)
+
+    package = "\n".join(sections)
+
+    output_dir = state.get("output_dir", "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, "delivery_package.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(package)
+
+    print(f"   Package saved to {filepath} ({len(package)} chars)")
+    return {"delivery_package": package}
+
+
+# ═══════════════════════════════════════════════
+# NODE 10 — PROJECT READER
+# ═══════════════════════════════════════════════
+
+
+def project_reader_node(state: SoftwareState):
+    project_path = state.get("project_path", "")
+    if not project_path or not os.path.isdir(project_path):
+        print(f"   Project path not found: {project_path}")
+        return {
+            "existing_structure": f"[Project path not found: {project_path}]",
+            "existing_code": {},
+        }
+
+    print(f"--- READER: Reading project at {project_path} ---")
+
+    structure = read_project_structure(project_path)
+    files = read_project_files(project_path)
+
+    print(f"   Files read: {len(files)}")
+    return {
+        "existing_structure": structure,
+        "existing_code": files,
+    }
+
+
+# ═══════════════════════════════════════════════
+# NODE 11 — PROJECT ANALYZER
+# ═══════════════════════════════════════════════
+
+
+def project_analyzer_node(state: SoftwareState):
+    print("--- ANALYZER: Analyzing existing project ---")
+    llms = _get_llms(state)
+
+    existing_files = state.get("existing_code", {})
+    files_preview = "\n\n".join(
+        f"--- {path} ---\n{content[:2000]}"
+        for path, content in list(existing_files.items())[:10]
+    )
+
+    chain = analyze_project_prompt() | llms["analyzer"]
+
+    try:
+        analysis: ProjectAnalysis = chain.invoke({
+            "structure": state.get("existing_structure", ""),
+            "files": files_preview,
+            "requirement": state.get("requirement", ""),
+        })
+    except OutputParserException:
+        print("   Analyzer parse failed; returning minimal analysis.")
+        return {
+            "tech_stack": state.get("tech_stack", "Unknown"),
+            "modules": list(existing_files.keys()),
+        }
+
+    print(f"   Detected stack: {analysis.tech_stack}")
+    print(f"   Existing modules: {analysis.modules}")
+    print(f"   Missing modules: {analysis.missing_modules}")
+
+    stories = []
+    if analysis.architecture_summary:
+        stories.append(f"Maintain existing architecture: {analysis.architecture_summary[:100]}")
+    for m in analysis.missing_modules:
+        stories.append(f"Add missing module: {m}")
+    for issue in analysis.issues[:3]:
+        stories.append(f"Fix issue: {issue}")
+
+    return {
+        "tech_stack": analysis.tech_stack,
+        "modules": analysis.modules + analysis.missing_modules,
+        "stories": stories or state.get("stories", []),
+        "pending_modules": analysis.missing_modules or analysis.modules,
+        "quality_guide": None,
+    }
+
+// ========== END OF FILE: agents.py ==========
+
+
+// ========== START OF FILE: state.py ==========
+from typing import TypedDict, List, Dict, Optional
+from pydantic import BaseModel, Field
+
+
+class ModuleList(BaseModel):
+    stories: List[str] = Field(description="User stories derived from requirements")
+    modules: List[str] = Field(description="Backend module names (e.g., auth, users, inventory)")
+    tech_stack: str = Field(default="", description="Detected or specified tech stack")
+
+
+class ArchitectureDoc(BaseModel):
+    tech_stack: str = Field(description="Primary tech stack")
+    db_schema: str = Field(description="Database schema definitions")
+    api_endpoints: str = Field(description="Key API endpoint designs")
+    folder_structure: str = Field(description="Project folder structure as a multi-line tree")
+    architecture_diagram: str = Field(description="Text-based architecture diagram")
+
+
+class ModuleFile(BaseModel):
+    path: str = Field(description="File path relative to project root")
+    purpose: str = Field(description="What this file contains")
+    exports: List[str] = Field(description="Key classes, functions, or variables defined here")
+
+
+class ModulePlan(BaseModel):
+    module_name: str = Field(description="Name of the module")
+    files: List[ModuleFile] = Field(description="Files to create for this module")
+    dependencies: List[str] = Field(description="Other modules this module depends on")
+    api_routes: List[str] = Field(description="API endpoints this module exposes")
+
+
+class CodeReview(BaseModel):
+    score: int = Field(description="Code quality score from 1 to 10")
+    issues: List[str] = Field(description="List of issues found")
+    logic_correctness: str = Field(description="Brief logic correctness analysis")
+    security_check: str = Field(description="Brief security analysis")
+
+
+class ProjectAnalysis(BaseModel):
+    tech_stack: str = Field(description="Detected tech stack")
+    modules: List[str] = Field(description="Existing module names found")
+    missing_modules: List[str] = Field(description="Modules that should exist but don't")
+    issues: List[str] = Field(description="Quality/security issues found")
+    architecture_summary: str = Field(description="Summary of existing project architecture")
+
+
+class SoftwareState(TypedDict):
+    requirement: str
+
+    mode: str                                # "create_new" | "analyze" | "update"
+    tech_stack: str                          # e.g. "Python/FastAPI", "Rust/Axum"
+    project_path: Optional[str]              # Target project directory on disk
+    output_dir: str                          # Base output directory
+    max_fix_attempts: int
+    review_threshold: int                    # Configurable, default 7
+
+    provider: str                            # "ollama" | "lm_studio"
+    llm_base_url: str                        # API endpoint URL
+    llm_model: str                           # Model identifier
+
+    stories: List[str]
+    architecture: Optional[str]
+    modules: List[str]
+    quality_guide: Optional[str]
+
+    pending_modules: List[str]
+    completed_modules: List[str]
+    current_module: Optional[str]
+    module_plan: Optional[str]
+
+    generated_code: Dict[str, str]
+    tests: Dict[str, str]
+
+    review_score: Optional[int]
+    review_issues: List[str]
+    fix_attempts: int
+
+    existing_structure: Optional[str]        # Tree string for analyze/update modes
+    existing_code: Dict[str, str]            # rel_path -> content for existing project
+    written_files: Dict[str, str]            # rel_path -> "ok" | "error: ..."
+
+    delivery_package: Optional[str]
+
+// ========== END OF FILE: state.py ==========
+
+
+// ========== START OF FILE: main.py ==========
+import sys
+from graph import app
+from state import SoftwareState
+from config import WorkflowConfig
+
+
+def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
+    requirement = cfg.requirement
+
+    if not requirement and cfg.mode.value in ("analyze", "update") and cfg.project_path:
+        requirement = f"Analyze and improve the project at {cfg.project_path}"
+    elif not requirement:
+        requirement = "Build a web application"
+
+    return {
+        "requirement": requirement,
+        "mode": cfg.mode.value,
+        "tech_stack": cfg.tech_stack or "",
+        "project_path": cfg.project_path,
+        "output_dir": cfg.output_dir,
+        "max_fix_attempts": cfg.max_fix_attempts,
+        "review_threshold": cfg.review_threshold,
+        "provider": cfg.provider,
+        "llm_base_url": cfg.llm_base_url,
+        "llm_model": cfg.llm_model,
+        "stories": [],
+        "architecture": None,
+        "modules": [],
+        "quality_guide": None,
+        "pending_modules": [],
+        "completed_modules": [],
+        "current_module": None,
+        "module_plan": None,
+        "generated_code": {},
+        "tests": {},
+        "review_score": None,
+        "review_issues": [],
+        "fix_attempts": 0,
+        "existing_structure": None,
+        "existing_code": {},
+        "written_files": {},
+        "delivery_package": None,
+    }
+
+
+HAS_FASTAPI = False
+try:
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    import asyncio
+    HAS_FASTAPI = True
+except ImportError:
+    pass
+
+
+def run_workflow(cfg: WorkflowConfig) -> SoftwareState:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    initial_state = config_to_initial_state(cfg)
+
+    config = {
+        "configurable": {"thread_id": cfg.thread_id},
+        "recursion_limit": cfg.recursion_limit,
+    }
+
+    print("=" * 60)
+    print("AI SOFTWARE DELIVERY TEAM")
+    print("=" * 60)
+    print(f"  Mode:        {cfg.mode.value}")
+    print(f"  Requirement: {cfg.requirement[:100] if cfg.requirement else '(none)'}")
+    print(f"  Project:     {cfg.project_path or '(will create)'}")
+    print(f"  Tech Stack:  {cfg.tech_stack or '(auto-detect)'}")
+    print(f"  LLM:         {cfg.llm_model}")
+    print(f"  Thread:      {cfg.thread_id}")
+    print("=" * 60 + "\n")
+
+    result = app.invoke(initial_state, config=config)
+
+    print("\n\n" + "=" * 60)
+    print("WORKFLOW COMPLETE")
+    print("=" * 60)
+
+    print(f"\nModules Completed: {result['completed_modules']}")
+    print(f"Total Code Files: {len(result['generated_code'])}")
+    print(f"Files Written to Disk: {len(result.get('written_files', {}))}")
+
+    written = result.get("written_files", {})
+    if written:
+        ok = sum(1 for v in written.values() if v == "ok")
+        errors = sum(1 for v in written.values() if v != "ok")
+        print(f"  Written: {ok} ok, {errors} errors")
+
+    package = result.get("delivery_package", "")
+    if package:
+        print(f"\nDelivery package: {len(package)} chars")
+
+    return result
+
+
+def cli_main():
+    cfg = WorkflowConfig.from_cli(sys.argv)
+    run_workflow(cfg)
+
+
+if HAS_FASTAPI:
+    import asyncio
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    fastapi_app = FastAPI(title="AI Software Delivery")
+
+    @fastapi_app.post("/run")
+    async def run_workflow_endpoint(config: WorkflowConfig):
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_workflow, config)
+        serializable = dict(result)
+        for k, v in serializable.items():
+            if hasattr(v, "model_dump"):
+                serializable[k] = v.model_dump()
+        return JSONResponse(content=serializable)
+else:
+    fastapi_app = None
+
+
+if __name__ == "__main__":
+    cli_main()
+
+// ========== END OF FILE: main.py ==========
+
+
+// ========== START OF FILE: config.py ==========
+import os
+import json
+import uuid
+import argparse
+from typing import Optional
+from enum import Enum
+from pydantic import BaseModel, Field
+
+
+class WorkflowMode(str, Enum):
+    CREATE_NEW = "create_new"
+    ANALYZE = "analyze"
+    UPDATE = "update"
+
+
+class WorkflowConfig(BaseModel):
+    thread_id: str = Field(default_factory=lambda: f"wf-{uuid.uuid4().hex[:8]}")
+    mode: WorkflowMode = WorkflowMode.CREATE_NEW
+
+    requirement: str = ""
+    project_path: Optional[str] = None
+    tech_stack: Optional[str] = None
+    output_dir: str = "outputs"
+
+    max_fix_attempts: int = 3
+    review_threshold: int = 7
+    recursion_limit: int = 150
+
+    provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama"))
+    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gemma3:12b-cloud"))
+    llm_base_url: str = Field(default_factory=lambda: os.getenv(
+        "LLM_BASE_URL",
+        os.getenv("OLLAMA_BASE_URL", "https://ollama.com"),
+    ))
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "WorkflowConfig":
+        import yaml
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        data.pop("mode", None)
+        return cls(mode=WorkflowMode(data["mode"]), **{k: v for k, v in data.items() if k != "mode"})
+
+    @classmethod
+    def from_json(cls, path: str) -> "WorkflowConfig":
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return cls(mode=WorkflowMode(data["mode"]), **{k: v for k, v in data.items() if k != "mode"})
+
+    @classmethod
+    def from_cli(cls, argv: list[str]) -> "WorkflowConfig":
+        parser = argparse.ArgumentParser(description="AI Software Delivery Team")
+        parser.add_argument("--config", help="Path to YAML/JSON config file (overlaid by CLI flags)")
+        parser.add_argument("--mode", choices=[m.value for m in WorkflowMode], help="Workflow mode")
+        parser.add_argument("--requirement", help="Software requirement description")
+        parser.add_argument("--project-path", help="Path to existing or target project")
+        parser.add_argument("--tech-stack", help='Tech stack (e.g. "Python/FastAPI", "Rust/Axum")')
+        parser.add_argument("--output-dir", default="outputs", help="Output directory")
+        parser.add_argument("--max-fix-attempts", type=int, help="Max review-fix cycles per module")
+        parser.add_argument("--review-threshold", type=int, help="Minimum score to pass review (1-10)")
+        parser.add_argument("--recursion-limit", type=int, help="LangGraph recursion limit")
+        parser.add_argument("--provider", choices=["ollama", "lm_studio"], help="LLM provider")
+        parser.add_argument("--llm-model", help="Model name")
+        parser.add_argument("--llm-base-url", help="LLM API base URL")
+        args = parser.parse_args(argv[1:])
+
+        if args.config:
+            if args.config.endswith((".yaml", ".yml")):
+                cfg = cls.from_yaml(args.config)
+            else:
+                cfg = cls.from_json(args.config)
+        else:
+            cfg = cls()
+
+        overrides = {k.replace("-", "_"): v for k, v in vars(args).items()
+                     if v is not None and k != "config"}
+        for key, val in overrides.items():
+            if key == "mode":
+                val = WorkflowMode(val)
+            setattr(cfg, key, val)
+
+        return cfg
+
+// ========== END OF FILE: config.py ==========
+
+
+// ========== START OF FILE: file_tools.py ==========
+import os
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+def parse_folder_structure(structure_str: str) -> List[str]:
+    lines = [l.rstrip() for l in structure_str.split("\n") if l.strip()]
+    if not lines:
+        return []
+
+    def _tree_prefix_count(s: str) -> int:
+        """Count tree-drawing connectors (├ └ │) in the leading portion."""
+        count = 0
+        for ch in s:
+            if ch in '├└│':
+                count += 1
+            elif ch in ' ─':
+                continue
+            else:
+                break
+        return count
+
+    def _strip_tree_prefix(s: str) -> str:
+        return re.sub(r'^[├└│─\s]+', '', s).strip()
+
+    is_tree = any(_tree_prefix_count(l.lstrip()) > 0 for l in lines)
+
+    if not is_tree:
+        indents = sorted({len(l) - len(l.lstrip()) for l in lines})
+        non_zero = [i for i in indents if i > 0]
+        if non_zero:
+            import math
+            step = math.gcd(*non_zero)
+        else:
+            step = 2
+    else:
+        step = 0
+
+    entries: list[tuple[int, str, bool]] = []
+
+    for line in lines:
+        if is_tree:
+            level = _tree_prefix_count(line.lstrip())
+            name = _strip_tree_prefix(line)
+            if not name:
+                continue
+        else:
+            ws = len(line) - len(line.lstrip())
+            level = ws // step if step else 0
+            name = line.strip()
+            if not name:
+                continue
+
+        is_dir = name.endswith("/") or not Path(name.rstrip("/")).suffix
+        name = name.rstrip("/")
+        entries.append((level, name, is_dir))
+
+    dirs: set[str] = set()
+    path_stack: list[str] = []
+
+    for level, name, is_dir in entries:
+        if level < len(path_stack):
+            del path_stack[level:]
+        while level > len(path_stack):
+            path_stack.append(name)
+
+        if is_dir:
+            if level == len(path_stack):
+                path_stack.append(name)
+            else:
+                path_stack[level:] = [name]
+            dirs.add("/".join(path_stack))
+        else:
+            if path_stack:
+                dirs.add("/".join(path_stack))
+
+    all_dirs: set[str] = set()
+    for d in dirs:
+        parts = d.replace("\\", "/").split("/")
+        for i in range(1, len(parts) + 1):
+            all_dirs.add("/".join(parts[:i]))
+
+    return sorted(all_dirs, key=lambda x: (x.count("/"), x))
+
+
+def ensure_directory(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def write_file(filepath: str, content: str) -> str:
+    try:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return "ok"
+    except Exception as e:
+        return f"error: {e}"
+
+
+def read_file(filepath: str) -> Optional[str]:
+    try:
+        return Path(filepath).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def parse_code_blocks(raw_code: str) -> Dict[str, str]:
+    if not raw_code.strip():
+        return {}
+
+    files: Dict[str, str] = {}
+
+    header_pattern = re.compile(
+        r'^[#\s]*[-=]{3,}\s*(.+?)\s*[-=]{3,}\s*$|'
+        r'^[#\s]*filename:\s*(.+?)\s*$|'
+        r'^[#\s]*[Ff]ile:\s*(.+?)\s*$',
+        re.MULTILINE
+    )
+
+    lines = raw_code.split("\n")
+    current_path: Optional[str] = None
+    current_content: List[str] = []
+
+    for line in lines:
+        m = header_pattern.match(line)
+        if m:
+            if current_path:
+                files[current_path] = cleanup_code_block_markers(
+                    "\n".join(current_content)
+                )
+            current_path = next(g for g in m.groups() if g is not None).strip()
+            current_content = []
+        elif current_path is not None:
+            current_content.append(line)
+
+    if current_path:
+        files[current_path] = cleanup_code_block_markers(
+            "\n".join(current_content)
+        )
+
+    if files:
+        return files
+
+    code_block_pattern = re.compile(r'```(?:\w+)?\n(.*?)```', re.DOTALL)
+    for match in code_block_pattern.finditer(raw_code):
+        block = match.group(1).strip()
+        if not block:
+            continue
+        first_line = block.split("\n")[0]
+        path_match = re.match(r'^[#\s/]*([\w./-]+\.\w+)\s*$', first_line)
+        if path_match:
+            path = path_match.group(1).strip()
+            content = "\n".join(block.split("\n")[1:]).strip()
+            if content:
+                files[path] = content
+
+    return files
+
+
+def cleanup_code_block_markers(raw_code: str) -> str:
+    result = re.sub(r'^```\w*\s*$', '', raw_code, flags=re.MULTILINE)
+    result = re.sub(r'^```\s*$', '', result, flags=re.MULTILINE)
+    result = re.sub(r'^# --- .+$', '', result, flags=re.MULTILINE)
+    result = re.sub(r'^# filename: .+$', '', result, flags=re.MULTILINE)
+    result = re.sub(r'^# File: .+$', '', result, flags=re.MULTILINE)
+    return result.strip()
+
+
+def write_module_files(base_path: str, module: str, code: str,
+                       folder_structure: str = "") -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    files = parse_code_blocks(code)
+
+    if not files:
+        module_dir = os.path.join(base_path, module)
+        filepath = os.path.join(module_dir, module)
+        status = write_file(filepath, cleanup_code_block_markers(code))
+        results[os.path.relpath(filepath, base_path).replace("\\", "/")] = status
+    else:
+        for rel_path, content in files.items():
+            full_path = os.path.join(base_path, rel_path.replace("\\", "/"))
+            status = write_file(full_path, cleanup_code_block_markers(content))
+            results[rel_path.replace("\\", "/")] = status
+
+    return results
+
+
+def write_test_files(base_path: str, tests: Dict[str, str]) -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    for module, content in tests.items():
+        files = parse_code_blocks(content)
+        if files:
+            for rel_path, file_content in files.items():
+                full_path = os.path.join(base_path, rel_path.replace("\\", "/"))
+                status = write_file(full_path, cleanup_code_block_markers(file_content))
+                results[rel_path.replace("\\", "/")] = status
+        else:
+            filepath = os.path.join(base_path, module)
+            status = write_file(filepath, cleanup_code_block_markers(content))
+            results[os.path.relpath(filepath, base_path).replace("\\", "/")] = status
+    return results
+
+
+def generate_config_files(project_path: str, tech_stack: str,
+                          project_name: str = "") -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    if not project_name:
+        project_name = os.path.basename(os.path.abspath(project_path))
+
+    tech = tech_stack.lower()
+
+    if any(k in tech for k in ("python", "fastapi", "django", "flask")):
+        pyproject = f"""[project]
+name = "{project_name}"
+version = "0.1.0"
+description = "Generated by AI Software Delivery Team"
+requires-python = ">=3.12"
+dependencies = []
+"""
+        results["pyproject.toml"] = write_file(
+            os.path.join(project_path, "pyproject.toml"), pyproject)
+        results["requirements.txt"] = write_file(
+            os.path.join(project_path, "requirements.txt"),
+            "# Add your dependencies here\n")
+        results[".env.example"] = write_file(
+            os.path.join(project_path, ".env.example"),
+            "# Environment Variables\nDATABASE_URL=\nSECRET_KEY=\n")
+
+    elif any(k in tech for k in ("node", "express", "react", "vue", "svelte")):
+        pkg = f"""{{
+  "name": "{project_name}",
+  "version": "1.0.0",
+  "description": "Generated by AI Software Delivery Team",
+  "main": "index.js",
+  "scripts": {{}},
+  "dependencies": {{}},
+  "devDependencies": {{}}
+}}
+"""
+        results["package.json"] = write_file(
+            os.path.join(project_path, "package.json"), pkg)
+        results[".env.example"] = write_file(
+            os.path.join(project_path, ".env.example"),
+            "# Environment Variables\nDATABASE_URL=\nSECRET_KEY=\n")
+
+    elif "rust" in tech:
+        cargo = f"""[package]
+name = "{project_name}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"""
+        results["Cargo.toml"] = write_file(
+            os.path.join(project_path, "Cargo.toml"), cargo)
+
+    elif "go" in tech:
+        results["go.mod"] = write_file(
+            os.path.join(project_path, "go.mod"),
+            f"module {project_name}\n\ngo 1.22\n")
+
+    gitignore_map = {
+        "python": "*.pyc\n__pycache__/\n.venv/\n.env\n*.egg-info/\ndist/\nbuild/\n.pytest_cache/\n",
+        "node": "node_modules/\n.env\ndist/\nbuild/\n*.log\n.next/\n",
+        "rust": "target/\n.env\n",
+        "go": "bin/\n.env\n*.exe\n",
+    }
+    gitignore_key = "python"
+    for key in gitignore_map:
+        if key in tech:
+            gitignore_key = key
+            break
+    results[".gitignore"] = write_file(
+        os.path.join(project_path, ".gitignore"), gitignore_map[gitignore_key])
+
+    return results
+
+
+def init_project_structure(base_path: str, folder_structure: str) -> None:
+    dirs = parse_folder_structure(folder_structure)
+    for d in dirs:
+        if d == ".":
+            continue
+        full_path = os.path.join(base_path, d.replace("\\", "/"))
+        ensure_directory(full_path)
+
+
+def read_project_structure(project_path: str) -> str:
+    base = Path(project_path)
+    if not base.exists():
+        return f"[Project path not found: {project_path}]"
+
+    lines: List[str] = [f"{base.name}/"]
+    _build_tree(base, lines, "")
+    return "\n".join(lines)
+
+
+def _build_tree(path: Path, lines: List[str], prefix: str) -> None:
+    entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    entries = [e for e in entries if not e.name.startswith(".") and e.name != "__pycache__"]
+
+    for i, entry in enumerate(entries):
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        lines.append(f"{prefix}{connector}{entry.name}")
+        if entry.is_dir():
+            extension = "    " if is_last else "│   "
+            _build_tree(entry, lines, prefix + extension)
+
+
+def read_project_files(project_path: str,
+                       patterns: Optional[List[str]] = None) -> Dict[str, str]:
+    if patterns is None:
+        patterns = ["**/*.py", "**/*.js", "**/*.ts", "**/*.rs", "**/*.go",
+                     "**/*.toml", "**/*.json", "**/*.yaml", "**/*.yml",
+                     "**/*.md", "**/*.env*", "**/*.txt"]
+
+    base = Path(project_path)
+    if not base.exists():
+        return {}
+
+    files: Dict[str, str] = {}
+    for pattern in patterns:
+        for path in base.glob(pattern):
+            if (path.is_file()
+                    and "node_modules" not in str(path)
+                    and ".venv" not in str(path)
+                    and "__pycache__" not in str(path)):
+                rel = str(path.relative_to(base)).replace("\\", "/")
+                content = read_file(str(path))
+                if content is not None:
+                    files[rel] = content
+    return files
+
+
+def extract_folder_structure_from_architecture(architecture: str) -> str:
+    if not architecture:
+        return ""
+
+    if "## Folder Structure" in architecture:
+        section = architecture.split("## Folder Structure")[1]
+        if "##" in section:
+            section = section.split("##")[0]
+        return section.strip()
+
+    if "folder_structure" in architecture:
+        m = re.search(
+            r'folder_structure["\']?\s*:\s*["\'](.+?)["\']',
+            architecture, re.DOTALL
+        )
+        if m:
+            return m.group(1).strip()
+
+    if "folder_structure" in architecture:
+        m = re.search(
+            r'folder_structure["\']?\s*:\s*\n\s*([\s\S]*?)(?=\n\s*\w+|$)',
+            architecture
+        )
+        if m:
+            return m.group(1).strip()
+
+    return ""
+
+// ========== END OF FILE: file_tools.py ==========
+
+

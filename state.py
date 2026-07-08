@@ -73,6 +73,7 @@ class WorkerState(TypedDict):
     stories: List[str]
     quality_guide: Optional[str]
     tech_stack: str
+    project_path: str
     provider: str
     llm_base_url: str
     llm_model: str
