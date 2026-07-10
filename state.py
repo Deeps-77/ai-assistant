@@ -146,6 +146,7 @@ class SoftwareState(TypedDict):
     run_dir: str                             # Per-run output directory with timestamp
     max_fix_attempts: int
     review_threshold: int                    # Configurable, default 7
+    adaptive_threshold: bool                 # Auto-lower threshold if score is stuck
     execution_mode: str                      # "parallel" | "sequential"
     max_concurrent_modules: int
 
@@ -159,9 +160,9 @@ class SoftwareState(TypedDict):
     modules: List[str]
     quality_guide: Optional[str]
 
-    pending_modules: Annotated[List[str], _append_list]
+    pending_modules: List[str]
     completed_modules: Annotated[List[str], _append_list]
-    batch_modules: Annotated[List[str], _append_list]  # Current parallel batch being dispatched
+    batch_modules: List[str]  # Current parallel batch being dispatched
     current_module: Optional[str]
     module_plan: Optional[str]
 

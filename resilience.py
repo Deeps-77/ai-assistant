@@ -1,7 +1,8 @@
 import time
 import random
 import types
-from typing import Any
+import functools
+from typing import Any, Callable, Optional, Tuple, Type
 
 
 def add_retry_to_llm(llm, max_retries: int = 2) -> Any:
@@ -39,3 +40,46 @@ def add_retry_to_llm(llm, max_retries: int = 2) -> Any:
     bound = types.MethodType(retry_invoke, llm)
     object.__setattr__(llm, "invoke", bound)
     return llm
+
+
+# ── Decorator-based retry (used in tests) ──────────────────────
+
+DEFAULT_RETRYABLE = (ConnectionError, TimeoutError, OSError)
+
+
+def with_retry(
+    max_attempts: int = 3,
+    backoff: float = 1.0,
+    retryable: Optional[Tuple[Type[Exception], ...]] = None,
+) -> Callable:
+    """Decorator: retry a function with exponential backoff on transient errors.
+
+    Usage::
+
+        @with_retry(max_attempts=3, backoff=0.5)
+        def flaky_call():
+            ...
+    """
+    if retryable is None:
+        retryable = DEFAULT_RETRYABLE
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except retryable as e:
+                    last_exception = e
+                    if attempt < max_attempts - 1:
+                        delay = min(backoff * (2 ** attempt) + random.uniform(0, 0.3), 10.0)
+                        time.sleep(delay)
+                    else:
+                        raise
+                except Exception:
+                    # Non-retryable — propagate immediately
+                    raise
+            raise last_exception
+        return wrapper
+    return decorator

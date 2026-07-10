@@ -1,7 +1,7 @@
 [project]
 name = "ai-assistant"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-agent AI software delivery assistant"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,3 +15,9 @@ dependencies = [
     "pyyaml>=6.0",
     "pytest>=8.0.0",
 ]
+
+[project.scripts]
+compile-reqs = "scripts.compile_reqs:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

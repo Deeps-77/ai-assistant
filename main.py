@@ -4,6 +4,8 @@ import datetime
 from graph import app
 from state import SoftwareState
 from config import WorkflowConfig
+from observability.tracing import Tracer
+from langgraph.types import Command
 
 
 def config_to_initial_state(cfg: WorkflowConfig) -> SoftwareState:
@@ -73,7 +75,35 @@ except ImportError:
     pass
 
 
-def run_workflow(cfg: WorkflowConfig) -> SoftwareState:
+def _invoke_with_interrupts(initial_state, config, interactive):
+    """Run the graph, surfacing/servicing human-in-the-loop interrupts.
+
+    Returns the final state, or the (paused) state carrying ``__interrupt__``
+    when running non-interactively and a human decision is required.
+    """
+    result = app.invoke(initial_state, config=config)
+    while isinstance(result, dict) and (result.get("__interrupt__") or result.get("__interrupts__")):
+        interrupts = result.get("__interrupt__") or result.get("__interrupts__")
+        if not interactive:
+            return result
+        intr = interrupts[0]
+        payload = getattr(intr, "value", intr)
+        if isinstance(payload, dict):
+            prompt = payload.get("prompt", "Approve Project? (yes/no): ")
+        else:
+            prompt = "Approve Project? (yes/no): "
+        choice = input(prompt).strip().lower()
+        feedback = ""
+        if choice == "no":
+            feedback = input("Enter feedback: ")
+        result = app.invoke(
+            Command(resume={"choice": choice, "feedback": feedback}),
+            config=config,
+        )
+    return result
+
+
+def run_workflow(cfg: WorkflowConfig, interactive: bool = True) -> SoftwareState:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
@@ -101,7 +131,24 @@ def run_workflow(cfg: WorkflowConfig) -> SoftwareState:
     print(f"  Thread:      {cfg.thread_id}")
     print("=" * 60 + "\n")
 
-    result = app.invoke(initial_state, config=config)
+    from observability.tracing import Tracer, push_tracer, pop_tracer
+
+    budget = float(os.getenv("OBSERVABILITY_BUDGET_USD", "0"))
+    # Observability is on by default; disable with OBSERVABILITY_ENABLED=0.
+    enabled = os.getenv("OBSERVABILITY_ENABLED", "1") != "0"
+    tracer = Tracer(run_id=cfg.thread_id, enabled=enabled)
+    tracer.global_budget_usd = budget or 0
+    push_tracer(tracer)
+    tracer.start_run(cfg.thread_id)
+    try:
+        result = _invoke_with_interrupts(initial_state, config, interactive)
+    finally:
+        tracer.end_run()
+        pop_tracer()
+
+    if isinstance(result, dict) and (result.get("__interrupt__") or result.get("__interrupts__")):
+        print("\n⏸  WORKFLOW PAUSED — human review required (provide a decision to resume).")
+        return result
 
     print("\n\n" + "=" * 60)
     print("WORKFLOW COMPLETE")
@@ -139,7 +186,15 @@ if HAS_FASTAPI:
     @fastapi_app.post("/run")
     async def run_workflow_endpoint(config: WorkflowConfig):
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, run_workflow, config)
+        # Non-interactive: if a human review is required the graph pauses and
+        # we return the interrupt payload instead of blocking on stdin.
+        result = await loop.run_in_executor(None, run_workflow, config, False)
+        interrupts = result.get("__interrupt__") or result.get("__interrupts__")
+        if interrupts:
+            return JSONResponse(status_code=202, content={
+                "status": "paused",
+                "interrupts": [getattr(i, "value", i) for i in interrupts],
+            })
         serializable = dict(result)
         for k, v in serializable.items():
             if hasattr(v, "model_dump"):

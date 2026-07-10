@@ -2,15 +2,16 @@
 
 ## 1. Project Overview
 
-This project is an **AI-powered multi-agent software delivery system** built on [LangGraph](https://langchain-ai.github.io/langgraph/). It simulates a software development team using LLM agents to:
+An **AI-powered multi-agent software delivery system** built on [LangGraph](https://langchain-ai.github.io/langgraph/). Simulates a software development team using LLM agents to:
 
 1. Analyze a plain-text requirement
 2. Break it into user stories and backend modules
 3. Design the system architecture
-4. Generate production-ready FastAPI code module by module
+4. Generate production-ready code module by module (in **parallel** via worker subgraph)
 5. Review and iteratively fix code until it passes quality checks
-6. Generate pytest unit tests
-7. Compile everything into a single delivery package (markdown)
+6. Generate pytest unit tests (deferred to per-module sandbox workers)
+7. Run tests in isolated sandboxes, fix failures
+8. Compile everything into a delivery package
 
 All agents communicate through a shared **state** (`SoftwareState`) and the workflow is a directed state graph with conditional routing.
 
@@ -21,48 +22,37 @@ All agents communicate through a shared **state** (`SoftwareState`) and the work
 | Component | Technology |
 |---|---|
 | Language | Python 3.12+ |
-| LLM Framework | LangChain 0.2+ |
-| Graph Orchestration | LangGraph 0.2+ |
-| LLM Provider | Ollama (cloud) |
-| Current Model | `gemma4:31b-cloud` |
+| LLM Framework | LangChain 1.3+ |
+| Graph Orchestration | LangGraph 1.2+ |
+| LLM Providers | Ollama / LM Studio (via `--provider`) |
 | Data Validation | Pydantic v2 |
 | Environment | `python-dotenv` |
-| Package Manager | `uv` (lockfile: `uv.lock`) |
+| Package Manager | `uv` |
+| Observability | Built-in `Tracer` (token counts, cost, JSONL logs) |
 
 ---
 
 ## 3. Quick Start
 
-### Prerequisites
-- Python 3.12+
-- `uv` package manager (or `pip`)
-- Ollama account / API key
-
-### Setup
-
 ```bash
-# Clone and enter the project
-cd ai-assistant
-
-# Create .env file
-# OLLAMA_API_KEY=<your-key>
-# OLLAMA_BASE_URL=https://ollama.com
-# OLLAMA_MODEL=gemma4:31b-cloud
-
-# Install dependencies
+# Install
 uv sync
 
-# Run the workflow
-uv run main.py
+# Run (Ollama default)
+uv run main.py --requirement "Build a todo app"
+
+# Run with LM Studio
+uv run main.py --requirement "Build a todo app" \
+  --provider lm_studio \
+  --llm-model "qwen/qwen3-4b" \
+  --llm-base-url "http://127.0.0.1:1234/v1"
+
+# Run with config file
+uv run main.py --config config.yaml
+
+# Run tests
+uv run pytest tests/
 ```
-
-### Output
-
-The workflow produces `outputs/delivery_package.md` containing:
-- Requirement & user stories
-- Architecture document (tech stack, DB schema, API endpoints, folder tree, architecture diagram)
-- Generated source code for each module
-- Generated pytest tests for each module
 
 ---
 
@@ -70,339 +60,224 @@ The workflow produces `outputs/delivery_package.md` containing:
 
 ```
 ai-assistant/
-├── .env                    # Ollama configuration
-├── .python-version         # Python version pinning
-├── pyproject.toml          # Project metadata & dependencies
-├── uv.lock                 # Lock file
-├── state.py                # SoftwareState TypedDict + Pydantic models
-├── agents.py               # All agent node functions
-├── graph.py                # LangGraph StateGraph construction & routing
-├── main.py                 # Application entry point
-├── outputs/                # Runtime output directory
-│   └── delivery_package.md # Final delivery document
-└── docs/
-    └── Phase-1.md          # This document
+├── main.py                  # Entry point + config → state mapping
+├── config.py                # WorkflowConfig (Pydantic) + CLI/YAML/JSON parsing
+├── state.py                 # SoftwareState, WorkerState, Pydantic models, reducers
+├── agents.py                # All agent node functions (~2000 lines)
+├── graph.py                 # LangGraph StateGraph + routing
+├── file_tools.py            # File I/O + @tool decorators
+├── prompts.py               # ChatPromptTemplate definitions
+├── resilience.py            # add_retry_to_llm, with_retry decorator
+├── sandbox.py               # Legacy sandbox (v1)
+├── sandbox_agent/           # V2 sandbox infra (environments, detector)
+├── observability/
+│   ├── __init__.py
+│   └── tracing.py           # Tracer, @trace_node, BudgetExceeded
+├── scripts/
+│   ├── __init__.py
+│   └── compile_reqs.py      # uv pip compile wrapper
+├── tests/
+│   └── test_graph_suite.py  # Unit + graph topology + tracing tests
+├── docs/
+│   └── Phase-1.md           # This document
+├── req.txt                  # Compiled dependencies (uv pip compile)
+├── pyproject.toml
+└── uv.lock
 ```
 
 ---
 
-## 5. State Schema (`state.py`)
+## 5. State Schema
 
-### `SoftwareState` (TypedDict)
+### `SoftwareState` (TypedDict) — main graph
 
-All agents read from and write to a shared `SoftwareState` dictionary. Fields are grouped by lifecycle phase:
+| Category | Field | Type | Reducer | Description |
+|---|---|---|---|---|
+| **Input** | `requirement` | `str` | replace | Raw user requirement |
+| | `tech_stack` | `Optional[str]` | replace | e.g. "Python/FastAPI" |
+| **Planning** | `stories` | `List[str]` | replace | User stories from Planner |
+| | `architecture` | `Optional[str]` | replace | Flattened architecture doc |
+| | `modules` | `List[str]` | replace | All module names |
+| | `quality_guide` | `Optional[str]` | replace | Quality rules for coder/fixer |
+| **Execution** | `pending_modules` | `List[str]` | **replace** | Modules not yet processed |
+| | `completed_modules` | `Annotated[List, _append_list]` | append | Modules finished |
+| | `batch_modules` | `List[str]` | **replace** | Current parallel batch |
+| **Code** | `generated_code` | `Annotated[Dict, operator.or_]` | merge | module → source code |
+| | `tests` | `Annotated[Dict, operator.or_]` | merge | module → test code |
+| **Review** | `review_score` | `Annotated[Optional[int], _max_score]` | max | Last review score (1-10) |
+| | `review_issues` | `Annotated[List, _append_list]` | append | Issues from last review |
+| | `fix_attempts` | `Annotated[int, _max_int]` | max | Fix attempts for current module |
+| | `score_history` | `Annotated[List[int], _append_int_list]` | append | Score history for convergence |
+| **Config** | `max_fix_attempts` | `int` | replace | Max retries (default: 3) |
+| | `review_threshold` | `int` | replace | Pass threshold (default: 7) |
+| | `adaptive_threshold` | `bool` | replace | Auto-lower threshold when stuck |
+| | `execution_mode` | `str` | replace | "parallel" or "sequential" |
+| | `max_retries` | `int` | replace | LLM transient retry count |
 
-| Category | Field | Type | Description |
-|---|---|---|---|
-| **Input** | `requirement` | `str` | Raw user requirement |
-| **Planning** | `stories` | `List[str]` | User stories from Planner |
-| | `architecture` | `Optional[str]` | Flattened architecture document |
-| | `modules` | `List[str]` | All module names |
-| | `quality_guide` | `Optional[str]` | Quality rules injected into coder/fixer prompts |
-| **Execution** | `pending_modules` | `List[str]` | Modules not yet processed |
-| | `completed_modules` | `List[str]` | Modules finished and accepted |
-| | `current_module` | `Optional[str]` | Module currently being worked on |
-| | `module_plan` | `Optional[str]` | Per-module file plan (from Module Planner) |
-| **Code** | `generated_code` | `Dict[str, str]` | `module_name → source code` |
-| | `tests` | `Dict[str, str]` | `module_name → test code` |
-| **Review** | `review_score` | `Optional[int]` | Last review score (1-10) |
-| | `review_issues` | `List[str]` | Issues from last review |
-| | `fix_attempts` | `int` | Number of fix attempts for current module |
-| | `max_fix_attempts` | `int` | Max retries before force-complete (default: 3) |
-| **Output** | `delivery_package` | `Optional[str]` | Final compiled markdown |
+### `WorkerState` (TypedDict) — per-module subgraph
 
-### Pydantic Models (Structured LLM Output)
+Used by the parallel worker subgraph. One instance per module. No reducers — each worker is isolated.
 
-| Model | Used By | Fields |
+| Field | Type | Source |
 |---|---|---|
-| `ModuleList` | Planner | `stories: List[str]`, `modules: List[str]` |
-| `ArchitectureDoc` | Architect | `tech_stack`, `db_schema`, `api_endpoints`, `folder_structure`, `architecture_diagram` (all `str`) |
-| `ModuleFile` | Module Planner | `path`, `purpose`, `exports: List[str]` |
-| `ModulePlan` | Module Planner | `module_name`, `files: List[ModuleFile]`, `dependencies: List[str]`, `api_routes: List[str]` |
-| `CodeReview` | Reviewer | `score: int`, `issues: List[str]`, `logic_correctness: str`, `security_check: str` |
+| `module_name` | `str` | Dispatched from SoftwareState |
+| `architecture`, `stories`, `quality_guide`, `tech_stack` | ... | From parent state |
+| `generated_code` | `Dict[str, str]` | Populated by worker_coder/fixer |
+| `review_score`, `review_issues`, `fix_attempts`, `score_history` | ... | Review cycle |
+| `max_fix_attempts`, `review_threshold` | `int` | Copied from config |
 
 ---
 
-## 6. Graph Architecture (`graph.py`)
+## 6. Graph Architecture
 
-### Node Flow
+### Node Flow (simplified)
 
 ```
 [START]
-   |
-   v
-Planner ──────────────────────────────────────→ stories + modules
-   |
-   v
-Architect ────────────────────────────────────→ tech_stack, db_schema, api_endpoints,
-   |                                              folder_structure (tree), architecture_diagram (ASCII)
-   v
-Backend Lead ──→ picks next pending module
-   |
-   ├── (module available) ──→ Module Planner
-   |                              |
-   |                              v
-   |                          Module Coder
-   |                              |
-   |                              v
-   |                          Reviewer
-   |                          ↙       ↘
-   |                     Fixer     Complete Module
-   |                      ↘         ↙
-   |                    (loop: max 3 attempts)
-   |                              |
-   └── (no modules) ──────────────┤
-                                   |
-                                   v
-                                QA Agent ──→ pytest tests
-                                   |
-                                   v
-                              Delivery ──→ delivery_package.md
-                                   |
-                                   v
-                                 [END]
+   │
+   ├── (analyze/update) → project_reader → project_analyzer ──┐
+   └── (create_new) ──────────────────────────────────────────┘
+   │
+   ▼
+Planner → Architect → Quality Gen → Project Init
+   │
+   ├── (parallel) → Dispatcher ──→ [Worker Subgraph × N] ──→ Batch Check ──→ Human Review
+   │                                                           │
+   └── (sequential) → Backend Lead → Module Planner → Coder → Reviewer → Fixer ~
+                                                                           │
+                                                     Human Review ←───────┘
+   │
+   ▼
+QA → Sandbox Dispatcher → [Sandbox Worker × N] → Delivery → [END]
 ```
 
-### Conditional Routing
+### Worker Subgraph (per module, parallel)
 
-**`route_after_backend_lead`** — Decides whether to process another module or move to QA:
-- `current_module` is set → route to `module_planner`
-- `current_module` is `None` (no pending modules) → route to `qa`
+```
+Worker Entry
+   │
+   ▼
+Worker Module Planner
+   │
+   ▼
+Worker Coder  (uses tool_llm with write_file_tool / create_directory_tool)
+   │
+   ▼
+Worker Reviewer
+   ├── (score ≥ threshold) → Worker Complete → return to Batch Check
+   └── (score < threshold) → Worker Fixer → Worker Coder (loop, max 3 attempts)
+```
 
-**`route_after_review`** — Decides whether to fix or accept the module:
-- `score >= 8` → pass, route to `complete_module`
-- `fix_attempts >= max_attempts` (3) → force-complete, route to `complete_module`
-- Otherwise → route to `fixer` for another fix iteration
+### Routing Functions
 
-### Edges Summary
-
-| From | To | Type |
+| Function | Returns | Logic |
 |---|---|---|
-| `planner` | `architect` | Fixed |
-| `architect` | `backend_lead` | Fixed |
-| `backend_lead` | `module_planner` or `qa` | Conditional |
-| `module_planner` | `module_coder` | Fixed |
-| `module_coder` | `reviewer` | Fixed |
-| `reviewer` | `fixer` or `complete_module` | Conditional |
-| `fixer` | `reviewer` | Fixed (loop) |
-| `complete_module` | `backend_lead` | Fixed (next module or finish) |
-| `qa` | `delivery` | Fixed |
-| `delivery` | `END` | Fixed |
+| `route_by_mode` | `"planner"` or `"project_reader"` | Based on `mode` field |
+| `route_after_dispatcher` | `"batch_sender"` or `"human_review"` | If `batch_modules` non-empty |
+| `route_after_batch_check` | `"dispatcher"` or `"human_review"` | If `pending_modules` non-empty |
+| `route_after_review` | `"fixer"` or `"complete_module"` | Score vs threshold + convergence |
+| `_route_after_worker_review` | `"worker_fixer"` or `"worker_complete"` | Same logic for worker subgraph |
+| `route_after_human` | `"qa"`, `"dispatcher"`, or `"backend_lead"` | Based on approval + execution mode |
+| `route_by_execution_mode` | `"dispatcher"` or `"backend_lead"` | Parallel vs sequential |
+| `route_after_backend_lead` | `"module_planner"` or `"human_review"` | Sequential fallback path |
 
-### Checkpointing
+### Convergence Detection
 
-The graph is compiled with `MemorySaver` checkpointer, enabling thread-level state persistence (configured via `thread_id` in the config).
-
----
-
-## 7. Agent Node Reference (`agents.py`)
-
-### 7.1 Planner
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Analyze the requirement, produce user stories and module names |
-| **LLM** | `planner_llm` — structured output via `ModuleList` (json_mode) |
-| **Prompt highlights** | Requests flat JSON with `stories` and `modules` arrays |
-| **Reads** | `state["requirement"]` |
-| **Writes** | `stories`, `modules`, `pending_modules`, `completed_modules`, `max_fix_attempts` |
-| **Fallback** | Catches `OutputParserException` → re-invokes with plain LLM → `_flatten_planner()` maps alternative field names (`user_stories`, `backend_modules`) |
-| **Safe default** | If fallback also fails, returns `["app"]` as single module |
-
-### 7.2 Architect
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Design the full system architecture |
-| **LLM** | `architect_llm` — structured output via `ArchitectureDoc` (json_mode) |
-| **Prompt highlights** | Requests 5 flat string fields; `folder_structure` must be multi-line tree; `architecture_diagram` must be ASCII component/flow diagram |
-| **Reads** | `state["stories"]`, `state["modules"]` |
-| **Writes** | `architecture` (flattened markdown string), `quality_guide` (constant) |
-| **Fallback** | Catches `OutputParserException` → plain LLM → `_flatten_architecture()` unwraps nested keys (`system_architecture`, `architecture`, `arch`) |
-
-### 7.3 Backend Lead (Dispatcher)
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Pick the next pending module from the queue |
-| **Logic** | Pops first item from `pending_modules`, sets `current_module` |
-| **Termination** | If `pending_modules` is empty, sets `current_module = None` → triggers QA phase |
-| **Reads** | `pending_modules` |
-| **Writes** | `current_module`, `pending_modules` |
-
-### 7.4 Module Planner
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Plan the files needed for the current module |
-| **LLM** | `module_planner_llm` — structured output via `ModulePlan` (json_mode) |
-| **Prompt highlights** | Requests file-by-file plan with `path`, `purpose`, `exports` per file; also outputs `dependencies` and `api_routes` |
-| **Reads** | `current_module`, `architecture`, `quality_guide` |
-| **Writes** | `module_plan` (flattened string) |
-| **Fallback** | `_flatten_module_plan()` — maps alternative field names (`name`, `deps`, `routes`) |
-
-### 7.5 Module Coder
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Write production FastAPI code for the current module |
-| **LLM** | Plain `llm` (no structured output — returns raw code) |
-| **Prompt highlights** | Receives `architecture`, `module_plan`, and `quality_guide`; asks for multi-file code with `# --- filename.py ---` separators |
-| **Reads** | `current_module`, `architecture`, `module_plan`, `quality_guide` |
-| **Writes** | `generated_code[module]`, `fix_attempts` (reset to 0) |
-| **Guard** | If LLM returns empty/whitespace content, inserts a `# TODO: implement` placeholder |
-
-### 7.6 Reviewer
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Score generated code (1-10) and list issues |
-| **LLM** | `reviewer_llm` — structured output via `CodeReview` (json_mode) |
-| **Prompt highlights** | Requests flat JSON with `score`, `issues` (array of strings), `logic_correctness`, `security_check` |
-| **Reads** | `current_module`, `generated_code[module]` |
-| **Writes** | `review_score`, `review_issues` |
-| **Guard** | If `code` is empty, returns score=1 without calling LLM |
-| **Fallback** | `_flatten_review()` — maps `quality_score`, `logic_correctness_analysis`, `security_analysis`; extracts `description` from dict-type issues |
-
-### 7.7 Fixer
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Fix code based on reviewer issues |
-| **LLM** | Plain `llm` |
-| **Prompt highlights** | Gets current code + issues list + `quality_guide`; returns corrected code |
-| **Reads** | `current_module`, `generated_code[module]`, `review_issues`, `fix_attempts`, `quality_guide` |
-| **Writes** | `generated_code[module]`, `fix_attempts` (incremented) |
-
-### 7.8 Complete Module
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Mark module as done, reset per-module state for next module |
-| **Logic** | Appends `current_module` to `completed_modules`; resets `module_plan`, `review_score`, `review_issues`, `fix_attempts`; sets `current_module = None` |
-| **Reads** | `current_module`, `completed_modules` |
-| **Writes** | `completed_modules`, `current_module`, `module_plan`, `review_score`, `review_issues`, `fix_attempts` |
-
-### 7.9 QA Agent
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Generate pytest unit tests for all completed modules |
-| **LLM** | Plain `llm` (once per module) |
-| **Prompt highlights** | Requests comprehensive pytest tests with edge cases |
-| **Reads** | `generated_code` (all entries) |
-| **Writes** | `tests[module]` for each module |
-
-### 7.10 Delivery
-
-| Attribute | Detail |
-|---|---|
-| **Purpose** | Compile everything into a final delivery markdown file |
-| **Sections** | Requirement → User Stories → Completed Modules → Architecture → Source Code → Test Code |
-| **Persistence** | Writes to `outputs/delivery_package.md` (path configurable via `OUTPUT_DIR` env var) |
-| **Reads** | All state fields |
-| **Writes** | `delivery_package` |
+Both `route_after_review` and `_route_after_worker_review` detect stuck scores:
+- **If `adaptive_threshold` is enabled** and the last two scores are equal below threshold, the passing bar is lowered to the current score (breaks the loop).
+- **If 4+ scores exist** and the best of the last 2 is ≤ best of the 2 before that, force-complete.
+- **If 3 identical scores**, force-complete.
 
 ---
 
-## 8. Quality Guide
+## 7. Tool Calling Architecture
 
-A constant `QUALITY_GUIDE` is defined in `agents.py` and injected into the Module Coder and Fixer prompts. It covers:
+Agents write files using LangChain `@tool`-decorated functions:
 
-| Category | Rules |
+| Tool | Purpose |
 |---|---|
-| **Python & FastAPI** | `datetime.now(timezone.utc)` over deprecated `utcnow()`; DB sessions via `Depends(get_db)`; async def endpoints; type hints everywhere |
-| **Security** | No hardcoded secrets; passwords hashed with bcrypt; JWT with expiration; input validation via Pydantic; no raw SQL |
-| **Architecture** | Separate files per concern (schemas, models, crud, routes); CRUD layer never raises HTTPException; dependency injection for services |
-| **Database** | Commits in API layer not CRUD; eager-load to avoid N+1; `order_by` on paginated queries; bounded pagination params |
-| **Code Quality** | No unused imports; no bare `except:`; no mutable defaults; enums for fixed value sets |
+| `write_file_tool` | Write code content to a file path |
+| `create_directory_tool` | Create a directory |
+| `read_file_tool` | Read file content (for analyze/update modes) |
+
+The `_execute_tool_calls()` helper in `agents.py` processes LLM responses with tool calls. If a tool-calling model returns no `write_file_tool` calls (e.g. only creates directories), the system re-prompts with a reinforcement message before falling back to the plain LLM.
 
 ---
 
-## 9. Error Handling & Resilience
+## 8. Observability
 
-| Scenario | Handling |
-|---|---|
-| **LLM returns wrong JSON field names** | `_flatten_*` helpers map alternative common names (e.g., `quality_score` → `score`, `system_architecture` → wrapper unwrap) |
-| **LLM returns nested JSON instead of flat** | `_flatten_architecture` unwraps `system_architecture` / `architecture` / `arch` wrapper keys |
-| **LLM returns non-JSON** | `json.JSONDecodeError` caught → safe defaults returned (empty plan, empty architecture, single-module planner) |
-| **LLM returns empty code** | Placeholder `# TODO: implement` inserted instead of empty string |
-| **Reviewer gets empty code** | Returns score=1 without calling LLM |
-| **Review loop exceeds max attempts** | Force-completes module with current score (avoids infinite loop) |
-| **Windows console can't print emoji** | `sys.stdout.reconfigure(encoding="utf-8")` in `main.py` |
+The `observability/tracing.py` module provides:
+
+- **`Tracer`** — Records per-node duration, estimated tokens, cost. Outputs:
+  - Stderr summary at end of run
+  - `logs/trace_<run_id>.jsonl` file
+- **`@trace_node`** — Decorator to wrap graph-node functions
+- **Budget cap** — Set `OBSERVABILITY_BUDGET_USD` env var to raise `BudgetExceeded` when exceeded
+- **Token estimation** — Uses `tiktoken` if available, else `chars/4` heuristic
 
 ---
 
-## 10. LLM Configuration
+## 9. Resilience
 
-The app uses Ollama cloud models configured via `.env`:
+| Layer | Mechanism |
+|---|---|
+| **Transient LLM failures** | `add_retry_to_llm()` wraps base LLM with exponential backoff + jitter (ConnectionError, TimeoutError, OSError). Covers ALL ~25 invoke sites. |
+| **Tool-call fallback** | When tool_llm returns only directory calls (no file writes), re-prompts with reinforced instruction. Then falls to plain LLM text output. |
+| **Empty code guard** | If all paths fail, inserts `# TODO: implement` placeholder. |
+| **Review convergence** | Detects stuck scores and force-completes module. |
+| **`with_retry` decorator** | `@with_retry(max_attempts=3, backoff=1.0)` for standalone functions. |
+| **`max_retries` CLI flag** | Configurable via `--max-retries N` or `WorkflowConfig.max_retries`. |
 
-```env
-OLLAMA_API_KEY=<key>
-OLLAMA_BASE_URL="https://ollama.com"
-OLLAMA_MODEL="gemma4:31b-cloud"
+---
+
+## 10. Configuration
+
+```bash
+# All CLI flags
+uv run main.py \
+  --requirement "..." \
+  --project-path ./outputs/project \
+  --tech-stack "Python/FastAPI" \
+  --mode create_new \
+  --provider ollama \
+  --llm-model "gemma4:31b-cloud" \
+  --llm-base-url "https://ollama.com" \
+  --execution-mode parallel \
+  --max-concurrent-modules 5 \
+  --max-fix-attempts 3 \
+  --review-threshold 7 \
+  --adaptive-threshold \
+  --max-retries 2 \
+  --sandbox-enabled \
+  --sandbox-mode local
 ```
 
-Four structured-output LLMs are created from the base model:
-
-```python
-planner_llm       = llm.with_structured_output(ModuleList,       method="json_mode")
-architect_llm     = llm.with_structured_output(ArchitectureDoc,  method="json_mode")
-module_planner_llm= llm.with_structured_output(ModulePlan,       method="json_mode")
-reviewer_llm      = llm.with_structured_output(CodeReview,       method="json_mode")
-```
-
-- **Temperature**: 0 (deterministic)
-- **Method**: `json_mode` (broad Ollama compatibility)
+Config file support: `--config config.yaml` or `--config config.json`.
 
 ---
 
-## 11. Current Behavior & Known Limitations
+## 11. Current Status
 
-### Scores from Latest Run
+| Feature | Status |
+|---|---|
+| Parallel module generation (worker subgraph) | ✅ |
+| Tool-calling coder/fixer (write_file_tool) | ✅ |
+| Plain LLM fallback (non-tool models) | ✅ |
+| Review-fix convergence detection | ✅ |
+| Adaptive threshold | ✅ |
+| Per-module parallel test generation | ✅ |
+| Sandbox test execution (parallel) | ✅ |
+| LM Studio provider | ✅ |
+| Human-in-the-loop review | ✅ |
+| Analyzer/update mode | ✅ |
+| CLI + YAML/JSON config | ✅ |
+| Retry on transient LLM failures | ✅ |
+| Observability tracing + cost tracking | ✅ |
+| `uv pip compile` script | ✅ |
+| Tests (reducers, routing, graph topology) | ✅ |
 
-| Module | Initial Score | Final Score | Attempts Used |
-|---|---|---|---|
-| auth | 4 | 7 | 3 |
-| users | 5 | 6 | 3 |
-| inventory | 5 | 7 | 3 |
+### Known Limitations
 
-- **No module passed** the score ≥ 8 threshold on its own; all were force-completed after 3 fix attempts.
-- Scores improved by 1-3 points per module through fix iterations, suggesting the fixer helps but cannot bridge the gap to passing.
-- With `max_fix_attempts=3`, a full 3-module run takes approximately 8-12 minutes total (30+ LLM calls).
-
-### Common Reviewer Issues (all modules)
-1. Hardcoded secrets / default config values
-2. Deprecated `datetime.utcnow()` usage
-3. Broken transaction management (commits in wrong layer)
-4. Race conditions in concurrent DB operations
-5. Missing input validation / weak password rules
-6. Generic exception handling (bare `except:`)
-7. Leaking HTTPExceptions from CRUD/service layers
-8. Inefficient queries (N+1, no pagination bounds)
-
----
-
-## 12. What Needs to Be Completed (Future Work)
-
-### Immediate Quality Improvements
-- [ ] **Model upgrade** — Switch from `gemma4:31b-cloud` to `qwen2.5-coder:7b` or `:14b` for better code generation
-- [ ] **Lower review threshold** — Change from 8 to 7 so modules reaching 7 pass earlier (saves fix attempts)
-- [ ] **Split generated code into separate files** — Currently all code blocks are in one monolithic markdown; write actual `.py` files per module
-
-### Architecture & Engineering
-- [ ] **Config file** — Replace hardcoded settings (threshold, max_attempts, model name) with a YAML/JSON config
-- [ ] **Human-in-the-loop gates** — Add approval steps before critical transitions (architect → coding, delivery)
-- [ ] **Parallel module generation** — Independent modules could be coded concurrently
-- [ ] **Async & streaming** — Stream LLM responses for faster feedback
-- [ ] **Persistent checkpointing** — Replace `MemorySaver` with SQLite/Postgres for resume capability
-- [ ] **Unit tests for the graph itself** — Test routing logic, error handling, and edge cases without LLM calls
-
-### Feature Additions
-- [ ] **Non-FastAPI support** — Allow configurable tech stacks beyond FastAPI/PostgreSQL
-- [ ] **Multi-language output** — Generate frontend code (React, Vue) alongside backend
-- [ ] **Git integration** — Commit generated code to a repo, create PRs, run CI checks
-- [ ] **Web UI** — Simple dashboard showing workflow progress, scores, and logs
-- [ ] **Custom quality rules** — Allow users to define their own quality guide via config
-- [ ] **Docker support** — Containerize the workflow for CI/CD pipelines
-- [ ] **Prompt versioning** — Track prompt changes and their effect on scores
+- **req.txt** is generated by `uv pip compile pyproject.toml -o req.txt`. Run `uv run compile-reqs` to regenerate.
+- Models may occasionally produce only `create_directory_tool` calls without writing files. The re-prompt usually recovers, but a small model may need multiple tries.
+- Tests require no API keys but the E2E test (`RUN_E2E=1`) needs a fake model factory wired up.

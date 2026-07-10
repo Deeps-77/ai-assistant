@@ -18,21 +18,15 @@ from state import (
     ProjectAnalysis,
     TestResult,
 )
-from sandbox import (
-    setup_sandbox,
-    run_tests_in_sandbox,
-    run_tests_in_sandbox_v2,
-    teardown_sandbox,
-    SandboxContext,
-)
 from sandbox_agent import (
     setup_sandbox as setup_sandbox_v2,
-    run_tests_in_sandbox as run_tests_v2,
-    teardown_sandbox as teardown_v2,
+    run_tests_in_sandbox as run_tests_in_sandbox_v2,
+    teardown_sandbox as teardown_sandbox_v2,
 )
 from sandbox_agent.context import SandboxContextV2
 from sandbox_agent.environments.base import SandboxMode
 from sandbox_agent.detector import detect_stack
+from langgraph.types import interrupt
 from prompts import (
     planner_prompt,
     planner_fallback_prompt,
@@ -65,6 +59,10 @@ from file_tools import (
 )
 
 load_dotenv()
+
+# Maximum seconds to wait for a single LLM call before it times out.
+# A hang otherwise blocks the whole graph; retries (resilience.py) still apply.
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))
 
 _llm_cache: dict = {}
 
@@ -106,7 +104,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
     if provider == "lm_studio":
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(base_url=base_url, api_key="lm-studio",
-                         model=model, temperature=0)
+                         model=model, temperature=0, timeout=LLM_TIMEOUT)
         add_retry_to_llm(llm, max_retries=max_retries)
         result = {
             "llm": llm,
@@ -119,7 +117,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
         }
     else:
         from langchain_ollama import ChatOllama
-        llm = ChatOllama(base_url=base_url, model=model, temperature=0)
+        llm = ChatOllama(base_url=base_url, model=model, temperature=0, timeout=LLM_TIMEOUT)
         add_retry_to_llm(llm, max_retries=max_retries)
         method = "json_mode"
         result = {
@@ -551,16 +549,24 @@ def _execute_tool_calls(response, project_path: str, label: str = "") -> tuple[d
                 rel_path = args.get("filepath", "")
                 content = args.get("content", "")
                 if rel_path:
-                    full_path = os.path.join(project_path, rel_path)
-                    result = write_file(full_path, content)
-                    written[rel_path.replace("\\", "/")] = result
-                    code_blocks[rel_path.replace("\\", "/")] = content
+                    try:
+                        full_path = os.path.join(project_path, rel_path)
+                        result = write_file(full_path, content)
+                        written[rel_path.replace("\\", "/")] = result
+                        code_blocks[rel_path.replace("\\", "/")] = content
+                    except Exception as e:
+                        print(f"{prefix}  write_file failed for {rel_path}: {e}")
+                        written[rel_path.replace("\\", "/")] = f"error: {e}"
             elif name == "create_directory_tool":
                 dir_path = args.get("path", "")
                 if dir_path:
-                    full_path = os.path.join(project_path, dir_path)
-                    ensure_directory(full_path)
-                    written[dir_path.replace("\\", "/") + "/"] = "ok"
+                    try:
+                        full_path = os.path.join(project_path, dir_path)
+                        ensure_directory(full_path)
+                        written[dir_path.replace("\\", "/") + "/"] = "ok"
+                    except Exception as e:
+                        print(f"{prefix}  create_directory failed for {dir_path}: {e}")
+                        written[dir_path.replace("\\", "/") + "/"] = f"error: {e}"
     else:
         print(f"{prefix}  (no tool calls in response)")
     return written, code_blocks
@@ -590,89 +596,119 @@ def module_coder_node(state: SoftwareState):
             "quality_guide": state.get("quality_guide", ""),
             "human_feedback": state.get("human_feedback", ""),
         })
+
+        # Try tool calling path first
+        written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="code")
+
+        if tool_code_blocks:
+            code_map = dict(state.get("generated_code", {}))
+            combined = "\n\n".join(
+                f"# --- {path} ---\n{content}"
+                for path, content in tool_code_blocks.items()
+            )
+            code_map[module] = combined
+
+            if planned_paths:
+                generated = list(tool_code_blocks.keys())
+                missing = [p for p in planned_paths if p not in generated]
+                extra = [p for p in generated if p not in planned_paths]
+                if missing:
+                    print(f"   WARNING: {len(missing)} planned files missing:")
+                    for p in missing:
+                        print(f"     MISSING: {p}")
+                if extra:
+                    print(f"   WARNING: {len(extra)} unexpected files:")
+                    for p in extra:
+                        print(f"     EXTRA: {p}")
+
+            print(f"   Tool calls: {len(written_files)} file(s) written")
+            return {
+                "generated_code": code_map,
+                "written_files": dict(state.get("written_files", {}), **written_files),
+                "fix_attempts": 0,
+            }
+
+        # Tool calls exist but none wrote files (e.g. only create_directory_tool)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"   Tool calls created dirs only; re-prompting tool_llm with file write instruction...")
+            reinforced_hf = (
+                "IMPORTANT: You MUST use the write_file_tool to write actual code files "
+                "with their full content. Creating directories alone is not enough. "
+                "Every file listed in the plan must be written using write_file_tool."
+            )
+            response2 = chain.invoke({
+                "tech_stack": tech_stack,
+                "module": module,
+                "architecture": state["architecture"],
+                "exact_file_paths": exact_file_paths,
+                "quality_guide": state.get("quality_guide", ""),
+                "human_feedback": reinforced_hf,
+            })
+            written_files2, tool_code_blocks2 = _execute_tool_calls(response2, project_path, label="code")
+            if tool_code_blocks2:
+                code_map = dict(state.get("generated_code", {}))
+                combined = "\n\n".join(
+                    f"# --- {path} ---\n{content}"
+                    for path, content in tool_code_blocks2.items()
+                )
+                code_map[module] = combined
+                print(f"   Tool calls (retry): {len(written_files2)} file(s) written")
+                return {
+                    "generated_code": code_map,
+                    "written_files": dict(state.get("written_files", {}), **written_files2),
+                    "fix_attempts": 0,
+                }
+
+        # Fallback: text-based approach
+        content = response.content or ""
+        if not content.strip():
+            print(f"   Empty response from tool_llm; retrying with plain LLM...")
+            try:
+                response = (prompt | llms["llm"]).invoke({
+                    "tech_stack": tech_stack,
+                    "module": module,
+                    "architecture": state["architecture"],
+                    "exact_file_paths": exact_file_paths,
+                    "quality_guide": state.get("quality_guide", ""),
+                    "human_feedback": state.get("human_feedback", ""),
+                })
+                content = response.content or ""
+            except Exception:
+                content = ""
+            if not content.strip():
+                print(f"   Empty response for [{module}]; generating placeholder.")
+                content = f"# {module} module\n# TODO: implement\n"
+
+        code_map = dict(state.get("generated_code", {}))
+        code_map[module] = content
+
+        generated_paths = list(parse_code_blocks(content).keys())
+        if planned_paths and generated_paths:
+            missing = [p for p in planned_paths if p not in generated_paths]
+            extra = [p for p in generated_paths if p not in planned_paths]
+            if missing:
+                print(f"   WARNING: {len(missing)} planned files missing from output:")
+                for p in missing:
+                    print(f"     MISSING: {p}")
+            if extra:
+                print(f"   WARNING: {len(extra)} unexpected files in output:")
+                for p in extra:
+                    print(f"     EXTRA: {p}")
+            if missing or extra:
+                print(f"   Planned: {planned_paths}")
+                print(f"   Generated: {generated_paths}")
+
+        return {
+            "generated_code": code_map,
+            "fix_attempts": 0,
+        }
+
     except Exception:
         print(f"   Module coder LLM call failed for [{module}]; using placeholder.")
         content = f"# {module} module\n# TODO: implement\n"
         code_map = dict(state.get("generated_code", {}))
         code_map[module] = content
         return {"generated_code": code_map, "fix_attempts": 0}
-
-    # Try tool calling path first
-    written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="code")
-
-    if tool_code_blocks:
-        # Tool calling succeeded — rebuild generated_code from tool outputs
-        code_map = dict(state.get("generated_code", {}))
-        combined = "\n\n".join(
-            f"# --- {path} ---\n{content}"
-            for path, content in tool_code_blocks.items()
-        )
-        code_map[module] = combined
-
-        if planned_paths:
-            generated = list(tool_code_blocks.keys())
-            missing = [p for p in planned_paths if p not in generated]
-            extra = [p for p in generated if p not in planned_paths]
-            if missing:
-                print(f"   WARNING: {len(missing)} planned files missing:")
-                for p in missing:
-                    print(f"     MISSING: {p}")
-            if extra:
-                print(f"   WARNING: {len(extra)} unexpected files:")
-                for p in extra:
-                    print(f"     EXTRA: {p}")
-
-        print(f"   Tool calls: {len(written_files)} file(s) written")
-        return {
-            "generated_code": code_map,
-            "written_files": dict(state.get("written_files", {}), **written_files),
-            "fix_attempts": 0,
-        }
-
-    # Fallback: text-based approach (no tool calls were made)
-    content = response.content or ""
-    if not content.strip():
-        # Last resort: retry with plain LLM (no tool binding) — model may not support tool calling
-        print(f"   Empty response from tool_llm; retrying with plain LLM...")
-        try:
-            response = (prompt | llms["llm"]).invoke({
-                "tech_stack": tech_stack,
-                "module": module,
-                "architecture": state["architecture"],
-                "exact_file_paths": exact_file_paths,
-                "quality_guide": state.get("quality_guide", ""),
-                "human_feedback": state.get("human_feedback", ""),
-            })
-            content = response.content or ""
-        except Exception:
-            content = ""
-        if not content.strip():
-            print(f"   Empty response for [{module}]; generating placeholder.")
-            content = f"# {module} module\n# TODO: implement\n"
-
-    code_map = dict(state.get("generated_code", {}))
-    code_map[module] = content
-
-    generated_paths = list(parse_code_blocks(content).keys())
-    if planned_paths and generated_paths:
-        missing = [p for p in planned_paths if p not in generated_paths]
-        extra = [p for p in generated_paths if p not in planned_paths]
-        if missing:
-            print(f"   WARNING: {len(missing)} planned files missing from output:")
-            for p in missing:
-                print(f"     MISSING: {p}")
-        if extra:
-            print(f"   WARNING: {len(extra)} unexpected files in output:")
-            for p in extra:
-                print(f"     EXTRA: {p}")
-        if missing or extra:
-            print(f"   Planned: {planned_paths}")
-            print(f"   Generated: {generated_paths}")
-
-    return {
-        "generated_code": code_map,
-        "fix_attempts": 0,
-    }
 
 
 # ═══════════════════════════════════════════════
@@ -765,6 +801,87 @@ def fixer_node(state: SoftwareState):
             "quality_guide": quality,
             "human_feedback": state.get("human_feedback", ""),
         })
+
+        # Try tool calling path first
+        written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="fix")
+
+        if tool_code_blocks:
+            code_map = dict(state["generated_code"])
+            combined = "\n\n".join(
+                f"# --- {path} ---\n{content}"
+                for path, content in tool_code_blocks.items()
+            )
+            code_map[module] = combined
+            written = dict(state.get("written_files", {}))
+            written.update(written_files)
+            return {
+                "generated_code": code_map,
+                "written_files": written,
+                "fix_attempts": attempts,
+            }
+
+        # Tool calls exist but none wrote files (e.g. only create_directory_tool)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"   Fix tool calls created dirs only; re-prompting tool_llm...")
+            reinforced_hf = (
+                "IMPORTANT: You MUST use the write_file_tool to write the fixed code files "
+                "with their full content. Creating directories alone is not enough."
+            )
+            response2 = chain.invoke({
+                "tech_stack": tech_stack,
+                "module": module,
+                "code": code,
+                "issues": "\n".join(f"- {i}" for i in issues),
+                "quality_guide": quality,
+                "human_feedback": reinforced_hf,
+            })
+            written_files2, tool_code_blocks2 = _execute_tool_calls(response2, project_path, label="fix")
+            if tool_code_blocks2:
+                code_map = dict(state["generated_code"])
+                combined = "\n\n".join(
+                    f"# --- {path} ---\n{content}"
+                    for path, content in tool_code_blocks2.items()
+                )
+                code_map[module] = combined
+                written = dict(state.get("written_files", {}))
+                written.update(written_files2)
+                return {
+                    "generated_code": code_map,
+                    "written_files": written,
+                    "fix_attempts": attempts,
+                }
+
+        # Fallback: text-based response
+        text = (response.content or "").strip()
+        if not text:
+            print(f"   Empty fix from tool_llm; retrying with plain LLM...")
+            try:
+                response = (prompt | llms["llm"]).invoke({
+                    "tech_stack": tech_stack,
+                    "module": module,
+                    "code": code,
+                    "issues": "\n".join(f"- {i}" for i in issues),
+                    "quality_guide": quality,
+                    "human_feedback": state.get("human_feedback", ""),
+                })
+                text = (response.content or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                print(f"   Fixer produced nothing for [{module}]; keeping original code.")
+                code_map = dict(state["generated_code"])
+                return {
+                    "generated_code": code_map,
+                    "fix_attempts": attempts,
+                }
+
+        code_map = dict(state["generated_code"])
+        code_map[module] = text
+        return {
+            "generated_code": code_map,
+            "fix_attempts": attempts,
+        }
+
     except Exception:
         print(f"   Fixer LLM call failed for [{module}]; keeping original code.")
         code_map = dict(state["generated_code"])
@@ -772,54 +889,6 @@ def fixer_node(state: SoftwareState):
             "generated_code": code_map,
             "fix_attempts": attempts,
         }
-
-    # Try tool calling path first
-    written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="fix")
-
-    code_map = dict(state["generated_code"])
-    if tool_code_blocks:
-        combined = "\n\n".join(
-            f"# --- {path} ---\n{content}"
-            for path, content in tool_code_blocks.items()
-        )
-        code_map[module] = combined
-        written = dict(state.get("written_files", {}))
-        written.update(written_files)
-        return {
-            "generated_code": code_map,
-            "written_files": written,
-            "fix_attempts": attempts,
-        }
-
-    # Fallback: text-based response
-    text = (response.content or "").strip()
-    if not text:
-        # Last resort: retry with plain LLM
-        print(f"   Empty fix from tool_llm; retrying with plain LLM...")
-        try:
-            response = (prompt | llms["llm"]).invoke({
-                "tech_stack": tech_stack,
-                "module": module,
-                "code": code,
-                "issues": "\n".join(f"- {i}" for i in issues),
-                "quality_guide": quality,
-                "human_feedback": state.get("human_feedback", ""),
-            })
-            text = (response.content or "").strip()
-        except Exception:
-            text = ""
-        if not text:
-            print(f"   Fixer produced nothing for [{module}]; keeping original code.")
-            return {
-                "generated_code": code_map,
-                "fix_attempts": attempts,
-            }
-
-    code_map[module] = text
-    return {
-        "generated_code": code_map,
-        "fix_attempts": attempts,
-    }
 
 
 # ═══════════════════════════════════════════════
@@ -901,13 +970,23 @@ def human_review_node(state: SoftwareState):
 
     print(f"\n📝 Requirement:\n  {state.get('requirement', '')[:200]}")
 
-    choice = input("\nApprove Project? (yes/no): ").strip().lower()
+    # Pause the graph and surface a decision to the client. On resume this
+    # call returns the value provided via Command(resume=...). Works headless
+    # and with the FastAPI server (no blocking stdin read).
+    decision = interrupt({
+        "type": "human_review",
+        "prompt": "Approve Project? (yes/no): ",
+        "completed_modules": state.get("completed_modules", []),
+    })
 
-    feedback = ""
+    if isinstance(decision, dict):
+        choice = str(decision.get("choice", "")).strip().lower()
+        feedback = decision.get("feedback", "") or ""
+    else:
+        choice = str(decision).strip().lower()
+        feedback = ""
 
     if choice == "no":
-        feedback = input("Enter feedback: ")
-
         return {
             "human_approved": False,
             "human_feedback": feedback,
@@ -1484,41 +1563,65 @@ def worker_coder(state: WorkerState) -> dict:
             "quality_guide": state.get("quality_guide", ""),
             "human_feedback": state.get("human_feedback", ""),
         })
-    except Exception:
-        print(f"      * [{module}] Coder LLM call failed; using placeholder.")
-        return {"generated_code": {module: f"# {module} module\n# TODO: implement\n"}}
 
-    # Try tool calling path first
-    written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="w_code")
+        # Try tool calling path first
+        written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="w_code")
 
-    if tool_code_blocks:
-        combined = "\n\n".join(
-            f"# --- {path} ---\n{content}"
-            for path, content in tool_code_blocks.items()
-        )
-        return {"generated_code": {module: combined}, "written_files": written_files}
+        if tool_code_blocks:
+            combined = "\n\n".join(
+                f"# --- {path} ---\n{content}"
+                for path, content in tool_code_blocks.items()
+            )
+            return {"generated_code": {module: combined}, "written_files": written_files}
 
-    # Fallback: text-based response
-    content = response.content or ""
-    if not content.strip():
-        # Last resort: retry with plain LLM (no tool binding)
-        print(f"      * [{module}] Empty from tool_llm; retrying with plain LLM...")
-        try:
-            response = (prompt | llms["llm"]).invoke({
+        # Tool calls exist but none wrote files (e.g. only create_directory_tool)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"      * [{module}] Tool calls created dirs only; re-prompting tool_llm...")
+            reinforced_hf = (
+                "IMPORTANT: You MUST use the write_file_tool to write actual code files "
+                "with their full content. Creating directories alone is not enough. "
+                "Every file listed in the plan must be written using write_file_tool."
+            )
+            response2 = (prompt | llms["tool_llm"]).invoke({
                 "tech_stack": tech_stack,
                 "module": module,
                 "architecture": state.get("architecture", ""),
                 "exact_file_paths": exact_file_paths,
                 "quality_guide": state.get("quality_guide", ""),
-                "human_feedback": state.get("human_feedback", ""),
+                "human_feedback": reinforced_hf,
             })
-            content = response.content or ""
-        except Exception:
-            content = ""
-        if not content.strip():
-            content = f"# {module} module\n# TODO: implement\n"
+            written_files2, tool_code_blocks2 = _execute_tool_calls(response2, project_path, label="w_code")
+            if tool_code_blocks2:
+                combined = "\n\n".join(
+                    f"# --- {path} ---\n{content}"
+                    for path, content in tool_code_blocks2.items()
+                )
+                return {"generated_code": {module: combined}, "written_files": written_files2}
 
-    return {"generated_code": {module: content}}
+        # Fallback: text-based response
+        content = response.content or ""
+        if not content.strip():
+            print(f"      * [{module}] Empty from tool_llm; retrying with plain LLM...")
+            try:
+                response = (prompt | llms["llm"]).invoke({
+                    "tech_stack": tech_stack,
+                    "module": module,
+                    "architecture": state.get("architecture", ""),
+                    "exact_file_paths": exact_file_paths,
+                    "quality_guide": state.get("quality_guide", ""),
+                    "human_feedback": state.get("human_feedback", ""),
+                })
+                content = response.content or ""
+            except Exception:
+                content = ""
+            if not content.strip():
+                content = f"# {module} module\n# TODO: implement\n"
+
+        return {"generated_code": {module: content}}
+
+    except Exception:
+        print(f"      * [{module}] Coder LLM call failed; using placeholder.")
+        return {"generated_code": {module: f"# {module} module\n# TODO: implement\n"}}
 
 
 def worker_reviewer(state: WorkerState) -> dict:
@@ -1579,42 +1682,65 @@ def worker_fixer(state: WorkerState) -> dict:
             "quality_guide": state.get("quality_guide", ""),
             "human_feedback": state.get("human_feedback", ""),
         })
-    except Exception:
-        print(f"      * [{module}] Fixer LLM call failed; keeping original code.")
-        return {"generated_code": state.get("generated_code", {}), "fix_attempts": attempts}
 
-    # Try tool calling path first
-    written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="w_fix")
+        # Try tool calling path first
+        written_files, tool_code_blocks = _execute_tool_calls(response, project_path, label="w_fix")
 
-    if tool_code_blocks:
-        combined = "\n\n".join(
-            f"# --- {path} ---\n{content}"
-            for path, content in tool_code_blocks.items()
-        )
-        return {"generated_code": {module: combined}, "fix_attempts": attempts, "written_files": written_files}
+        if tool_code_blocks:
+            combined = "\n\n".join(
+                f"# --- {path} ---\n{content}"
+                for path, content in tool_code_blocks.items()
+            )
+            return {"generated_code": {module: combined}, "fix_attempts": attempts, "written_files": written_files}
 
-    # Fallback: text-based response
-    text = (response.content or "").strip()
-    if not text:
-        # Last resort: retry with plain LLM
-        print(f"      * [{module}] Empty fix from tool_llm; retrying with plain LLM...")
-        try:
-            response = (prompt | llms["llm"]).invoke({
+        # Tool calls exist but none wrote files (e.g. only create_directory_tool)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            print(f"      * [{module}] Fix tool calls created dirs only; re-prompting tool_llm...")
+            reinforced_hf = (
+                "IMPORTANT: You MUST use the write_file_tool to write the fixed code files "
+                "with their full content. Creating directories alone is not enough."
+            )
+            response2 = (prompt | llms["tool_llm"]).invoke({
                 "tech_stack": tech_stack,
                 "module": module,
                 "code": code,
                 "issues": "\n".join(f"- {i}" for i in issues),
                 "quality_guide": state.get("quality_guide", ""),
-                "human_feedback": state.get("human_feedback", ""),
+                "human_feedback": reinforced_hf,
             })
-            text = (response.content or "").strip()
-        except Exception:
-            text = ""
-        if not text:
-            print(f"      * [{module}] Fixer produced nothing; keeping original code.")
-            return {"generated_code": state.get("generated_code", {}), "fix_attempts": attempts}
+            written_files2, tool_code_blocks2 = _execute_tool_calls(response2, project_path, label="w_fix")
+            if tool_code_blocks2:
+                combined = "\n\n".join(
+                    f"# --- {path} ---\n{content}"
+                    for path, content in tool_code_blocks2.items()
+                )
+                return {"generated_code": {module: combined}, "fix_attempts": attempts, "written_files": written_files2}
 
-    return {"generated_code": {module: text}, "fix_attempts": attempts}
+        # Fallback: text-based response
+        text = (response.content or "").strip()
+        if not text:
+            print(f"      * [{module}] Empty fix from tool_llm; retrying with plain LLM...")
+            try:
+                response = (prompt | llms["llm"]).invoke({
+                    "tech_stack": tech_stack,
+                    "module": module,
+                    "code": code,
+                    "issues": "\n".join(f"- {i}" for i in issues),
+                    "quality_guide": state.get("quality_guide", ""),
+                    "human_feedback": state.get("human_feedback", ""),
+                })
+                text = (response.content or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                print(f"      * [{module}] Fixer produced nothing; keeping original code.")
+                return {"generated_code": state.get("generated_code", {}), "fix_attempts": attempts}
+
+        return {"generated_code": {module: text}, "fix_attempts": attempts}
+
+    except Exception:
+        print(f"      * [{module}] Fixer LLM call failed; keeping original code.")
+        return {"generated_code": state.get("generated_code", {}), "fix_attempts": attempts}
 
 
 def worker_complete(state: WorkerState) -> dict:
@@ -1961,8 +2087,59 @@ def sandbox_worker_node(state: SandboxWorkerState) -> dict:
         _log_failure(run_dir, module, "FATAL_SANDBOX_ERROR", str(e), 0, str(e))
         cleanup_paths = [sandbox_temp_dir]
 
+    # Copy any improved files from the sandbox back into the real project so
+    # test fixes actually reach the delivered code, and collect the final
+    # code/tests so the graph state reflects what was actually tested.
+    final_code = ""
+    final_tests = ""
+    if os.path.isdir(project_sandbox_dir):
+        code_files: dict[str, str] = {}
+        test_files: dict[str, str] = {}
+        for root, _, files in os.walk(project_sandbox_dir):
+            if "venv" in root or "__pycache__" in root:
+                continue
+            for fname in files:
+                src = os.path.join(root, fname)
+                rel = os.path.relpath(src, project_sandbox_dir).replace("\\", "/")
+                if rel in ("requirements.txt", "pyproject.toml"):
+                    continue
+                low = rel.lower()
+                is_test = (
+                    low.startswith("test_") or "/test_" in low
+                    or low.startswith("tests/") or "/tests/" in low
+                )
+                try:
+                    with open(src, encoding="utf-8") as fh:
+                        content = fh.read()
+                except Exception:
+                    continue
+                if is_test:
+                    test_files[rel] = content
+                else:
+                    code_files[rel] = content
+                # Mirror the (possibly fixed) file into the real project
+                dst = os.path.join(project_path, rel)
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+                    written[rel] = "ok"
+                except Exception:
+                    pass
+        final_code = "\n\n".join(
+            f"# --- {p} ---\n{c}" for p, c in code_files.items()
+        )
+        final_tests = "\n\n".join(
+            f"# --- {p} ---\n{c}" for p, c in test_files.items()
+        )
+
+    fallback_result = {
+        "passed": 0, "failed": 0, "errors": 1,
+        "output": "Sandbox worker failed", "success": False,
+    }
     return {
-        "test_results": {module: test_results.get(module, {"passed": 0, "failed": 0, "errors": 1, "output": "Sandbox worker failed", "success": False})},
+        "test_results": {module: test_results.get(module, fallback_result)},
         "written_files": written,
+        "generated_code": {module: final_code} if final_code else {},
+        "tests": {module: final_tests} if final_tests else {},
         "sandbox_cleanup_paths": cleanup_paths,
     }

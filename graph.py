@@ -1,7 +1,8 @@
 from typing import Literal
-from langgraph.constants import Send
+from langgraph.types import Send
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from observability.tracing import trace_node
 from state import SoftwareState, WorkerState
 from agents import (
     planner_node,
@@ -56,6 +57,15 @@ def route_after_review(state: SoftwareState) -> Literal["fixer", "complete_modul
     attempts = state.get("fix_attempts", 0)
     max_attempts = state.get("max_fix_attempts", 3)
     score_history = state.get("score_history", [])
+    adaptive = state.get("adaptive_threshold", False)
+
+    # Adaptive threshold: if the score is stuck and hasn't improved,
+    # lower the passing bar to the current score to break the loop.
+    if adaptive and score < threshold and len(score_history) >= 2:
+        if score_history[-1] == score_history[-2]:
+            threshold = score
+            print(f"   Adaptive threshold lowered to {threshold} (score stuck "
+                  f"at {score_history[-1]}).")
 
     if score >= threshold:
         print(f"   Review PASSED (score={score}/{threshold}). Completing module.")
@@ -97,6 +107,14 @@ def _route_after_worker_review(state: WorkerState) -> Literal["worker_fixer", "w
     max_att = state.get("max_fix_attempts", 3)
     threshold = state.get("review_threshold", 7)
     score_history = state.get("score_history", [])
+    adaptive = state.get("adaptive_threshold", False)
+
+    # Adaptive threshold: lower the bar when score is stuck
+    if adaptive and score < threshold and len(score_history) >= 2:
+        if score_history[-1] == score_history[-2]:
+            threshold = score
+            print(f"      Adaptive threshold lowered to {threshold} (score stuck "
+                  f"at {score_history[-1]}).")
 
     if score >= threshold:
         print(f"      ✓  Score {score}/10 — PASS")
@@ -119,11 +137,11 @@ def _route_after_worker_review(state: WorkerState) -> Literal["worker_fixer", "w
 
 worker_builder = StateGraph(WorkerState)
 
-worker_builder.add_node("worker_module_planner", worker_module_planner)
-worker_builder.add_node("worker_coder", worker_coder)
-worker_builder.add_node("worker_reviewer", worker_reviewer)
-worker_builder.add_node("worker_fixer", worker_fixer)
-worker_builder.add_node("worker_complete", worker_complete)
+worker_builder.add_node("worker_module_planner", trace_node("worker_module_planner")(worker_module_planner))
+worker_builder.add_node("worker_coder", trace_node("worker_coder")(worker_coder))
+worker_builder.add_node("worker_reviewer", trace_node("worker_reviewer")(worker_reviewer))
+worker_builder.add_node("worker_fixer", trace_node("worker_fixer")(worker_fixer))
+worker_builder.add_node("worker_complete", trace_node("worker_complete")(worker_complete))
 
 worker_builder.set_entry_point("worker_module_planner")
 worker_builder.add_edge("worker_module_planner", "worker_coder")
@@ -215,6 +233,28 @@ def route_after_batch_check(state: SoftwareState) -> Literal["dispatcher", "huma
     return "human_review"
 
 
+def route_after_sandbox_worker(state: SoftwareState) -> Literal["test_fixer", "delivery"]:
+    """After parallel sandbox workers fan in, only deliver if every module's
+    tests passed; otherwise route to the (final-attempt) test fixer."""
+    test_results = state.get("test_results", {})
+    if not test_results:
+        return "delivery"
+    for r in test_results.values():
+        success = r.get("success", False) if isinstance(r, dict) else False
+        if not success:
+            return "test_fixer"
+    return "delivery"
+
+
+def route_after_test_fixer(state: SoftwareState) -> Literal["test_executor", "file_writer"]:
+    """In parallel mode there is no central test executor after the sandbox
+    workers, so persist the fixed code via file_writer; in sequential mode
+    re-run the tests via test_executor (existing loop)."""
+    if state.get("execution_mode") == "parallel":
+        return "file_writer"
+    return "test_executor"
+
+
 # ─── PARALLEL SANDBOX DISPATCHER ────────────────────────────
 
 def _sandbox_route(state: SoftwareState) -> list[Send]:
@@ -258,25 +298,25 @@ def route_after_human(state: SoftwareState) -> Literal["qa", "dispatcher", "back
 
 workflow = StateGraph(SoftwareState)
 
-workflow.add_node("planner", planner_node)
-workflow.add_node("architect", architect_node)
-workflow.add_node("quality_gen", quality_gen_node)
-workflow.add_node("project_init", project_init_node)
+workflow.add_node("planner", trace_node("planner")(planner_node))
+workflow.add_node("architect", trace_node("architect")(architect_node))
+workflow.add_node("quality_gen", trace_node("quality_gen")(quality_gen_node))
+workflow.add_node("project_init", trace_node("project_init")(project_init_node))
 
-workflow.add_node("backend_lead", backend_lead_node)
-workflow.add_node("module_planner", module_planner_node)
-workflow.add_node("module_coder", module_coder_node)
-workflow.add_node("reviewer", reviewer_node)
-workflow.add_node("fixer", fixer_node)
-workflow.add_node("complete_module", complete_module_node)
+workflow.add_node("backend_lead", trace_node("backend_lead")(backend_lead_node))
+workflow.add_node("module_planner", trace_node("module_planner")(module_planner_node))
+workflow.add_node("module_coder", trace_node("module_coder")(module_coder_node))
+workflow.add_node("reviewer", trace_node("reviewer")(reviewer_node))
+workflow.add_node("fixer", trace_node("fixer")(fixer_node))
+workflow.add_node("complete_module", trace_node("complete_module")(complete_module_node))
 
-workflow.add_node("dispatcher", dispatcher_node)
+workflow.add_node("dispatcher", trace_node("dispatcher")(dispatcher_node))
 workflow.add_node("batch_sender", lambda s: {})  # pass-through; routing handled by _batch_sender_route
-workflow.add_node("worker_entry", worker_entry_node)
-workflow.add_node("batch_check", batch_check_node)  # fan-in after parallel batch
+workflow.add_node("worker_entry", trace_node("worker_entry")(worker_entry_node))
+workflow.add_node("batch_check", trace_node("batch_check")(batch_check_node))  # fan-in after parallel batch
 
-workflow.add_node("human_review", human_review_node)
-workflow.add_node("qa", qa_node)
+workflow.add_node("human_review", trace_node("human_review")(human_review_node))
+workflow.add_node("qa", trace_node("qa")(qa_node))
 
 # Human-in-the-loop routing
 workflow.add_conditional_edges(
@@ -290,16 +330,16 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_node("sandbox_dispatcher", lambda s: {})  # pass-through; routing via _sandbox_route
-workflow.add_node("sandbox_worker_entry", sandbox_worker_node)
+workflow.add_node("sandbox_worker_entry", trace_node("sandbox_worker_entry")(sandbox_worker_node))
 
-workflow.add_node("sandbox_setup", sandbox_setup_node)
-workflow.add_node("test_executor", test_executor_node)
-workflow.add_node("test_fixer", test_fixer_node)
-workflow.add_node("sandbox_cleanup", sandbox_cleanup_node)
-workflow.add_node("file_writer", file_writer_node)
-workflow.add_node("delivery", delivery_node)
-workflow.add_node("project_reader", project_reader_node)
-workflow.add_node("project_analyzer", project_analyzer_node)
+workflow.add_node("sandbox_setup", trace_node("sandbox_setup")(sandbox_setup_node))
+workflow.add_node("test_executor", trace_node("test_executor")(test_executor_node))
+workflow.add_node("test_fixer", trace_node("test_fixer")(test_fixer_node))
+workflow.add_node("sandbox_cleanup", trace_node("sandbox_cleanup")(sandbox_cleanup_node))
+workflow.add_node("file_writer", trace_node("file_writer")(file_writer_node))
+workflow.add_node("delivery", trace_node("delivery")(delivery_node))
+workflow.add_node("project_reader", trace_node("project_reader")(project_reader_node))
+workflow.add_node("project_analyzer", trace_node("project_analyzer")(project_analyzer_node))
 
 # Entry: route by create_new / analyze / update
 
@@ -420,11 +460,25 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge("test_fixer", "test_executor")
+workflow.add_conditional_edges(
+    "test_fixer",
+    route_after_test_fixer,
+    {
+        "test_executor": "test_executor",
+        "file_writer": "file_writer",
+    },
+)
 
 # Delivery (shared)
 
-workflow.add_edge("sandbox_worker_entry", "delivery")  # parallel sandbox path
+workflow.add_conditional_edges(
+    "sandbox_worker_entry",
+    route_after_sandbox_worker,
+    {
+        "test_fixer": "test_fixer",
+        "delivery": "delivery",
+    },
+)
 workflow.add_edge("file_writer", "sandbox_cleanup")
 workflow.add_edge("sandbox_cleanup", "delivery")
 workflow.add_edge("delivery", END)
