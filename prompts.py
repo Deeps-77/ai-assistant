@@ -7,6 +7,7 @@ def planner_prompt() -> ChatPromptTemplate:
         "break it into user stories and backend modules.\n"
         "Module names must be simple lowercase strings like 'auth', 'users', 'inventory'.\n\n"
         "Requirement: {requirement}\n\n"
+        "Previous feedback to incorporate (if any):\n{human_feedback}\n\n"
         "Also detect the likely tech stack from the requirement.\n\n"
         "Return ONLY a single flat JSON object with exactly these three keys:\n"
         '- "stories": an array of strings\n'
@@ -113,6 +114,9 @@ def reviewer_prompt() -> ChatPromptTemplate:
     return ChatPromptTemplate.from_template(
         "You are a strict {tech_stack} code reviewer. "
         "Review this code for the '{module}' module.\n\n"
+        "Security focus: {security_focus}. If 'True', scrutinize especially "
+        "for SQL injection, XSS, auth bypass, secret leakage, and input "
+        "validation gaps.\n\n"
         "Code:\n{code}\n\n"
         "Return ONLY a single flat JSON object with **exactly** these four top-level keys:\n"
         '- "score": an integer 1-10\n'
@@ -191,4 +195,51 @@ def analyze_project_prompt() -> ChatPromptTemplate:
         '{{"tech_stack": "...", "modules": [...], '
         '"missing_modules": [...], "issues": [...], '
         '"architecture_summary": "..."}}'
+    )
+
+
+def analysis_report_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_template(
+        "You are a senior software engineer writing a clear, concise report about "
+        "an existing codebase for its owner.\n\n"
+        "Detected tech stack: {tech_stack}\n\n"
+        "Existing modules: {modules}\n\n"
+        "Missing modules: {missing_modules}\n\n"
+        "Issues found:\n{issues}\n\n"
+        "Architecture summary:\n{architecture_summary}\n\n"
+        "Write a markdown report with these sections:\n"
+        "1. **Overview** — what the project is and its tech stack.\n"
+        "2. **Architecture & Modules** — how it is organized, key modules and their roles.\n"
+        "3. **Observations & Issues** — the issues found, briefly explained.\n"
+        "4. **Suggestions** — 2-4 concrete, prioritized recommendations.\n\n"
+        "Be specific and grounded in the details above. Do not invent modules or "
+        "capabilities that were not detected. Keep it readable."
+    )
+
+
+def supervisor_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_template(
+        "You are the SUPERVISOR of a multi-agent software delivery team. "
+        "Given a user requirement, decide HOW the delivery pipeline should run "
+        "by choosing which stages to execute and with what strictness.\n\n"
+        "Requirement: {requirement}\n\n"
+        "Plan mode requested (user toggled /plan): {plan_mode}\n\n"
+        "Return ONLY a single flat JSON object with exactly these keys:\n"
+        '- "pause_for_plan_approval": boolean — if true, show the plan and '
+        "pause for the user's approval BEFORE generating any code (set true when "
+        "plan_mode is true or the user asked for a plan).\n"
+        '- "skip_build": boolean — true only if the user explicitly wants ONLY a '
+        "plan and no code generated yet.\n"
+        '- "skip_tests": boolean — true to skip the QA / test stage entirely '
+        "(e.g. for throwaway prototypes).\n"
+        '- "execution_mode": "parallel" or "sequential"\n'
+        '- "review_threshold": integer 1-10 (higher = stricter quality bar)\n'
+        '- "max_fix_attempts": integer >= 1 (review-fix cycles per module)\n'
+        '- "security_focus": boolean — true for auth/security-sensitive work\n'
+        '- "notes": a short string explaining your decision\n\n'
+        "Example:\n"
+        '{{"pause_for_plan_approval": false, "skip_build": false, '
+        '"skip_tests": false, "execution_mode": "parallel", '
+        '"review_threshold": 7, "max_fix_attempts": 3, '
+        '"security_focus": false, "notes": "standard build"}}'
     )

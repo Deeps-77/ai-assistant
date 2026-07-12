@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from langgraph.types import Command
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -68,6 +69,7 @@ route_after_batch_check   = getattr(graph_mod, "route_after_batch_check", None)
 route_by_execution_mode   = getattr(graph_mod, "route_by_execution_mode", None)
 route_after_human         = getattr(graph_mod, "route_after_human", None)
 route_after_backend_lead  = getattr(graph_mod, "route_after_backend_lead", None)
+route_after_analyzer      = getattr(graph_mod, "route_after_analyzer", None)
 route_by_mode             = getattr(graph_mod, "route_by_mode", None)
 
 # compiled graph (app)
@@ -301,6 +303,11 @@ def test_routers_return_valid_node_names():
     if route_after_backend_lead is not None:
         cases.append((route_after_backend_lead, {"current_module": None}))
 
+    if route_after_analyzer is not None:
+        cases.append((route_after_analyzer, {"mode": "analyze"}))
+        cases.append((route_after_analyzer, {"mode": "create_new"}))
+        cases.append((route_after_analyzer, {"mode": "update"}))
+
     if route_by_mode is not None:
         cases.append((route_by_mode, {"mode": "create_new"}))
 
@@ -335,7 +342,7 @@ def test_graph_has_core_nodes():
         "human_review", "qa", "delivery",
         "sandbox_setup", "test_executor", "test_fixer", "file_writer",
         "backend_lead", "module_planner", "module_coder", "reviewer", "fixer",
-        "complete_module",
+        "complete_module", "project_reader", "project_analyzer", "analysis_report",
     }
     missing = expected - present
     assert not missing, f"missing expected nodes: {missing}"
@@ -345,6 +352,69 @@ def test_graph_has_core_nodes():
 def test_graph_entry_point_resolves():
     g = compiled_graph.get_graph()
     assert g.nodes, "graph has no nodes"
+
+
+@require_state
+def test_analyze_mode_is_read_only_report(monkeypatch):
+    """`analyze` mode must read the project, produce a report, and write NO files."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableLambda
+
+    from agents import _make_json_llm
+    from state import ProjectAnalysis
+    from config import WorkflowConfig, WorkflowMode
+    from main import config_to_initial_state
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    original_entries = set(os.listdir(tmp))
+
+    analysis_json = json.dumps({
+        "tech_stack": "Python",
+        "modules": ["app"],
+        "missing_modules": [],
+        "issues": ["no tests"],
+        "architecture_summary": "single file script",
+    })
+
+    def fake_analyzer_llm(_):
+        return AIMessage(content=analysis_json)
+
+    def fake_report_llm(_):
+        return AIMessage(content="## Report\nThis is a read-only report.")
+
+    fake_llms = {
+        "llm": RunnableLambda(fake_report_llm),
+        "tool_llm": RunnableLambda(lambda _: AIMessage(content="")),
+        "planner": RunnableLambda(lambda _: AIMessage(content="")),
+        "architect": RunnableLambda(lambda _: AIMessage(content="")),
+        "module_planner": RunnableLambda(lambda _: AIMessage(content="")),
+        "reviewer": RunnableLambda(lambda _: AIMessage(content="")),
+        "analyzer": _make_json_llm(RunnableLambda(fake_analyzer_llm), ProjectAnalysis),
+    }
+
+    with monkeypatch.context() as m:
+        m.setattr(agents_mod, "_get_llms", lambda state: fake_llms)
+        cfg = WorkflowConfig(
+            mode=WorkflowMode("analyze"),
+            requirement="analyze this project and tell me about it",
+            project_path=str(tmp),
+            output_dir=str(tmp),
+        )
+        initial = config_to_initial_state(cfg)
+        result = graph_mod.app.invoke(
+            initial, config={"configurable": {"thread_id": "analyze-test"}}
+        )
+
+    assert result.get("delivery_package"), "analyze should produce a report"
+    assert "read-only report" in result["delivery_package"]
+    # No files/dirs should have been created by the analyze path.
+    assert set(os.listdir(tmp)) == original_entries, "analyze wrote files to the project"
+
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +462,222 @@ def test_budget_exceeded(tmp_path):
     with pytest.raises(BudgetExceeded):
         t.record_end(rec, in_text="x" * 100000, out_text="y" * 100000, model="gpt-4o")
     t.end_run()
+
+
+# ---------------------------------------------------------------------------
+# PLAN MODE + SUPERVISOR (deterministic, no API keys)
+# ---------------------------------------------------------------------------
+
+def _fake_llms_with_supervisor(supervisor_json: str) -> dict:
+    """Build a fake `_get_llms` result including a supervisor LLM."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableLambda
+    from agents import _make_json_llm
+
+    modulelist = json.dumps({
+        "stories": ["Build the app"], "modules": ["app"],
+        "tech_stack": "Python/FastAPI",
+    })
+    arch = json.dumps({
+        "tech_stack": "Python/FastAPI", "db_schema": "",
+        "api_endpoints": "", "folder_structure": "app/\n",
+        "architecture_diagram": "",
+    })
+    codereview = json.dumps({
+        "score": 8, "issues": [], "logic_correctness": "ok",
+        "security_check": "ok",
+    })
+    projanalysis = json.dumps({
+        "tech_stack": "Python", "modules": ["app"], "missing_modules": [],
+        "issues": [], "architecture_summary": "x",
+    })
+
+    def mk(content):
+        return RunnableLambda(lambda _: AIMessage(content=content))
+
+    return {
+        "llm": mk("print('hi from fake')"),
+        "tool_llm": mk(""),
+        "planner": _make_json_llm(mk(modulelist), state_mod.ModuleList),
+        "architect": _make_json_llm(mk(arch), state_mod.ArchitectureDoc),
+        "module_planner": _make_json_llm(mk(""), state_mod.ModulePlan),
+        "reviewer": _make_json_llm(mk(codereview), state_mod.CodeReview),
+        "analyzer": _make_json_llm(mk(projanalysis), state_mod.ProjectAnalysis),
+        "supervisor": _make_json_llm(mk(supervisor_json), state_mod.ExecutionPlan),
+    }
+
+
+@require_state
+def test_plan_mode_pauses_before_building(monkeypatch):
+    """With plan approval requested, the graph must pause at plan_review
+    (before generating code), not at human_review."""
+    sup = json.dumps({
+        "pause_for_plan_approval": True, "skip_build": False,
+        "skip_tests": False, "execution_mode": "parallel",
+        "review_threshold": 7, "max_fix_attempts": 3,
+        "security_focus": False, "notes": "plan",
+    })
+    with monkeypatch.context() as m:
+        m.setattr(agents_mod, "_get_llms", lambda s: _fake_llms_with_supervisor(sup))
+        init = {
+            "requirement": "build a login API with JWT",
+            "mode": "create_new",
+            "plan_mode": True,
+            "project_path": str(Path(tempfile.mkdtemp())),
+        }
+        result = compiled_graph.invoke(
+            init, config={"configurable": {"thread_id": "plan-pause"}}
+        )
+    assert result.get("__interrupt__"), "expected graph to pause at plan_review"
+    payload = result["__interrupt__"][0]
+    value = getattr(payload, "value", payload)
+    assert value.get("type") == "plan_review", value
+    # No code should have been generated yet.
+    assert not result.get("generated_code"), "plan mode must not build before approval"
+
+
+@require_state
+def test_plan_mode_approve_continues_to_build(monkeypatch):
+    """Approving the plan resumes and continues into the build (reaching
+    the final human_review interrupt)."""
+    sup = json.dumps({
+        "pause_for_plan_approval": True, "skip_build": False,
+        "skip_tests": False, "execution_mode": "parallel",
+        "review_threshold": 7, "max_fix_attempts": 3,
+        "security_focus": False, "notes": "plan",
+    })
+    with monkeypatch.context() as m:
+        m.setattr(agents_mod, "_get_llms", lambda s: _fake_llms_with_supervisor(sup))
+        init = {
+            "requirement": "build a login API with JWT",
+            "mode": "create_new",
+            "plan_mode": True,
+            "project_path": str(Path(tempfile.mkdtemp())),
+        }
+        result = compiled_graph.invoke(
+            init, config={"configurable": {"thread_id": "plan-approve"}}
+        )
+        assert result.get("__interrupt__")
+        result = compiled_graph.invoke(
+            # type: ignore[arg-type]
+            Command(
+                resume={"choice": "yes", "feedback": ""}
+            ),
+            config={"configurable": {"thread_id": "plan-approve"}},
+        )
+    # After approval it should have proceeded past the plan gate and built.
+    assert result.get("completed_modules") is not None
+    assert result.get("generated_code"), "approval should have triggered a build"
+    # And it should now be paused at the final human_review (not plan_review).
+    assert result.get("__interrupt__"), "expected final human_review interrupt"
+    final_value = getattr(result["__interrupt__"][0], "value", result["__interrupt__"][0])
+    assert final_value.get("type") != "plan_review"
+
+
+@require_state
+def test_plan_mode_reject_loops_to_planner(monkeypatch):
+    """Rejecting the plan loops back to the planner (another plan_review)."""
+    sup = json.dumps({
+        "pause_for_plan_approval": True, "skip_build": False,
+        "skip_tests": False, "execution_mode": "parallel",
+        "review_threshold": 7, "max_fix_attempts": 3,
+        "security_focus": False, "notes": "plan",
+    })
+    with monkeypatch.context() as m:
+        m.setattr(agents_mod, "_get_llms", lambda s: _fake_llms_with_supervisor(sup))
+        init = {
+            "requirement": "build a login API with JWT",
+            "mode": "create_new",
+            "plan_mode": True,
+            "project_path": str(Path(tempfile.mkdtemp())),
+        }
+        result = compiled_graph.invoke(
+            init, config={"configurable": {"thread_id": "plan-reject"}}
+        )
+        result = compiled_graph.invoke(
+            Command(
+                resume={"choice": "no", "feedback": "make it smaller"}
+            ),
+            config={"configurable": {"thread_id": "plan-reject"}},
+        )
+    assert result.get("__interrupt__"), "expected to pause again at plan_review"
+    value = getattr(result["__interrupt__"][0], "value", result["__interrupt__"][0])
+    assert value.get("type") == "plan_review"
+    assert "smaller" in (result.get("human_feedback") or "")
+
+
+@require_state
+def test_supervisor_skip_build_delivers_plan(monkeypatch):
+    """Supervisor skip_build + approved -> deliver plan, no code, no further interrupt."""
+    sup = json.dumps({
+        "pause_for_plan_approval": True, "skip_build": True,
+        "skip_tests": False, "execution_mode": "parallel",
+        "review_threshold": 7, "max_fix_attempts": 3,
+        "security_focus": False, "notes": "plan only",
+    })
+    with monkeypatch.context() as m:
+        m.setattr(agents_mod, "_get_llms", lambda s: _fake_llms_with_supervisor(sup))
+        init = {
+            "requirement": "plan a login API with JWT",
+            "mode": "create_new",
+            "plan_mode": True,
+            "project_path": str(Path(tempfile.mkdtemp())),
+        }
+        result = compiled_graph.invoke(
+            init, config={"configurable": {"thread_id": "plan-skipbuild"}}
+        )
+        result = compiled_graph.invoke(
+            Command(
+                resume={"choice": "yes", "feedback": ""}
+            ),
+            config={"configurable": {"thread_id": "plan-skipbuild"}},
+        )
+    assert not result.get("__interrupt__"), "plan-only should end without a build interrupt"
+    assert result.get("delivery_package"), "plan-only should produce a delivery package"
+
+
+@require_state
+def test_route_after_human_skip_tests():
+    if route_after_human is None:
+        pytest.skip("route_after_human not exported")
+    target = route_after_human({
+        "human_approved": True, "skip_tests": True, "execution_mode": "parallel",
+    })
+    assert target == "delivery", f"skip_tests must bypass QA: {target}"
+    target = route_after_human({
+        "human_approved": True, "skip_tests": False, "execution_mode": "parallel",
+    })
+    assert target == "qa"
+
+
+@require_state
+def test_get_llms_exposes_supervisor_for_both_providers():
+    """Regression: both the ollama (default) and lm_studio branches of
+    `_get_llms` must expose a 'supervisor' LLM, otherwise the
+    supervisor node silently falls back to a static default plan."""
+    from agents import _get_llms
+    for provider, base_url in (("ollama", "https://ollama.com"),
+                                ("lm_studio", "http://localhost:1234/v1")):
+        llms = _get_llms({
+            "provider": provider,
+            "llm_base_url": base_url,
+            "llm_model": "test-model",
+        })
+        assert "supervisor" in llms, (
+            f"{provider} branch of _get_llms is missing the 'supervisor' LLM"
+        )
+
+
+@require_state
+def test_route_after_plan_review_branches():
+    if "route_after_plan_review" not in dir(graph_mod):
+        pytest.skip("route_after_plan_review not exported")
+    r = graph_mod.route_after_plan_review
+    assert r({"plan_rejected": True}) == "planner"
+    assert r({"plan_rejected": False, "plan_approved": True,
+               "execution_plan": {"skip_build": True}}) == "delivery"
+    assert r({"plan_rejected": False, "plan_approved": True,
+               "execution_plan": {"skip_build": False}}) == "project_init"
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ class WorkflowConfig(BaseModel):
     project_path: Optional[str] = None
     tech_stack: Optional[str] = None
     output_dir: str = "outputs"
+    plan_mode: bool = False                  # opencode-style: pause for plan approval
 
     max_fix_attempts: int = 3
     review_threshold: int = 7
@@ -41,6 +42,7 @@ class WorkflowConfig(BaseModel):
         "LLM_BASE_URL",
         os.getenv("OLLAMA_BASE_URL", "https://ollama.com"),
     ))
+    ctx_size: Optional[int] = None  # Ollama only: sets `num_ctx` context window
 
     @classmethod
     def from_yaml(cls, path: str) -> "WorkflowConfig":
@@ -61,6 +63,8 @@ class WorkflowConfig(BaseModel):
         parser = argparse.ArgumentParser(description="AI Software Delivery Team")
         parser.add_argument("--config", help="Path to YAML/JSON config file (overlaid by CLI flags)")
         parser.add_argument("--mode", choices=[m.value for m in WorkflowMode], help="Workflow mode")
+        parser.add_argument("--plan-mode", action="store_true",
+                            help="opencode-style: pause for plan approval before building")
         parser.add_argument("--requirement", help="Software requirement description")
         parser.add_argument("--project-path", help="Path to existing or target project")
         parser.add_argument("--tech-stack", help='Tech stack (e.g. "Python/FastAPI", "Rust/Axum")')

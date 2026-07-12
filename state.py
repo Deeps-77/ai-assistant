@@ -45,6 +45,40 @@ class TestResult(BaseModel):
     success: bool = Field(default=False, description="Whether all tests passed")
 
 
+class ExecutionPlan(BaseModel):
+    """Structured plan produced by the supervisor agent.
+
+    Decides the delivery graph flow per-prompt instead of the rigid
+    fixed pipeline. Consumed by routing functions in :mod:`graph`.
+    """
+
+    pause_for_plan_approval: bool = Field(
+        default=False,
+        description="Pause after planning to show the plan for approval before building.",
+    )
+    skip_build: bool = Field(
+        default=False,
+        description="Plan-only request: do not generate code after approval.",
+    )
+    skip_tests: bool = Field(
+        default=False,
+        description="Skip the QA / test stage entirely.",
+    )
+    execution_mode: str = Field(
+        default="parallel", description="'parallel' or 'sequential'"
+    )
+    review_threshold: int = Field(
+        default=7, description="Minimum review score to pass (1-10)", ge=1, le=10
+    )
+    max_fix_attempts: int = Field(
+        default=3, description="Max review-fix cycles per module", ge=1
+    )
+    security_focus: bool = Field(
+        default=False, description="Emphasize security review."
+    )
+    notes: str = Field(default="", description="Short rationale for the chosen flow")
+
+
 class ProjectAnalysis(BaseModel):
     tech_stack: str = Field(description="Detected tech stack")
     modules: List[str] = Field(description="Existing module names found")
@@ -140,9 +174,11 @@ class SoftwareState(TypedDict):
     requirement: str
 
     mode: str                                # "create_new" | "analyze" | "update"
+    plan_mode: bool                           # opencode-style: pause for plan approval before building
     tech_stack: Optional[str]                # e.g. "Python/FastAPI", "Rust/Axum", or None
     project_path: Optional[str]              # Target project directory on disk
     output_dir: str                          # Base output directory
+    execution_plan: Optional[dict]           # ExecutionPlan produced by the supervisor agent
     run_dir: str                             # Per-run output directory with timestamp
     max_fix_attempts: int
     review_threshold: int                    # Configurable, default 7
@@ -153,12 +189,15 @@ class SoftwareState(TypedDict):
     provider: str                            # "ollama" | "lm_studio"
     llm_base_url: str                        # API endpoint URL
     llm_model: str                           # Model identifier
+    ctx_size: Optional[int]                  # Ollama only: context window (num_ctx)
     max_retries: int                         # Max retries on transient LLM failures
 
     stories: List[str]
     architecture: Optional[str]
     modules: List[str]
     quality_guide: Optional[str]
+
+    analysis: Optional[ProjectAnalysis]  # Structured result of `analyze` mode
 
     pending_modules: List[str]
     completed_modules: Annotated[List[str], _append_list]
@@ -176,6 +215,13 @@ class SoftwareState(TypedDict):
 
     human_approved: bool
     human_feedback: str
+
+    # Supervisor-decided flow controls (set by supervisor_node)
+    skip_tests: bool                          # skip the QA / test stage
+    security_focus: bool                      # emphasize security review
+    plan_approved: bool                      # plan_review interrupt outcome
+    plan_rejected: bool                      # plan_review rejected -> regenerate
+    plan_reviews_completed: Annotated[int, operator.add]  # count of resolved plan_review gates
 
     existing_structure: Optional[str]        # Tree string for analyze/update modes
     existing_code: Dict[str, str]            # rel_path -> content for existing project

@@ -14,6 +14,9 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0",
     "pytest>=8.0.0",
+    "deepagents>=0.6.12",
+    "aiosqlite>=0.22.1",
+    "uvicorn>=0.51.0",
 ]
 
 [project.scripts]
@@ -21,3 +24,4 @@ compile-reqs = "scripts.compile_reqs:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

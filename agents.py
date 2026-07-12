@@ -17,6 +17,7 @@ from state import (
     CodeReview,
     ProjectAnalysis,
     TestResult,
+    ExecutionPlan,
 )
 from sandbox_agent import (
     setup_sandbox as setup_sandbox_v2,
@@ -42,6 +43,8 @@ from prompts import (
     qa_prompt,
     test_fixer_prompt,
     analyze_project_prompt,
+    analysis_report_prompt,
+    supervisor_prompt,
 )
 from file_tools import (
     extract_folder_structure_from_architecture,
@@ -94,7 +97,8 @@ def _get_llms(state: dict) -> dict[str, Any]:
     base_url = state.get("llm_base_url", "https://ollama.com")
     model = state.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "gemma3:12b-cloud"
     max_retries = int(state.get("max_retries", 2))
-    cache_key = f"{provider}:{base_url}:{model}"
+    ctx_size = state.get("ctx_size")
+    cache_key = f"{provider}:{base_url}:{model}:{ctx_size}"
 
     if cache_key in _llm_cache:
         return _llm_cache[cache_key]
@@ -114,10 +118,14 @@ def _get_llms(state: dict) -> dict[str, Any]:
             "module_planner": _make_json_llm(llm, ModulePlan),
             "reviewer": _make_json_llm(llm, CodeReview),
             "analyzer": _make_json_llm(llm, ProjectAnalysis),
+            "supervisor": _make_json_llm(llm, ExecutionPlan),
         }
     else:
         from langchain_ollama import ChatOllama
-        llm = ChatOllama(base_url=base_url, model=model, temperature=0, timeout=LLM_TIMEOUT)
+        ollama_kwargs = {"base_url": base_url, "model": model, "temperature": 0, "timeout": LLM_TIMEOUT}
+        if ctx_size:
+            ollama_kwargs["num_ctx"] = ctx_size
+        llm = ChatOllama(**ollama_kwargs)
         add_retry_to_llm(llm, max_retries=max_retries)
         method = "json_mode"
         result = {
@@ -128,6 +136,7 @@ def _get_llms(state: dict) -> dict[str, Any]:
             "module_planner": llm.with_structured_output(ModulePlan, method=method),
             "reviewer": llm.with_structured_output(CodeReview, method=method),
             "analyzer": llm.with_structured_output(ProjectAnalysis, method=method),
+            "supervisor": llm.with_structured_output(ExecutionPlan, method=method),
         }
     _llm_cache[cache_key] = result
     return result
@@ -235,7 +244,10 @@ def planner_node(state: SoftwareState):
     chain = prompt | llms["planner"]
 
     try:
-        result: ModuleList = chain.invoke({"requirement": state["requirement"]})
+        result: ModuleList = chain.invoke({
+            "requirement": state["requirement"],
+            "human_feedback": state.get("human_feedback", "") or "",
+        })
     except (OutputParserException, TypeError, ValueError, KeyError):
         print("   Planner structured output failed; attempting fallback...")
         try:
@@ -384,6 +396,197 @@ def quality_gen_node(state: SoftwareState):
 # ═══════════════════════════════════════════════
 # NODE 2c — PROJECT INIT
 # ═══════════════════════════════════════════════
+
+
+def _flatten_execution_plan(raw: dict) -> dict:
+    d = raw if isinstance(raw, dict) else {}
+
+    def _as_bool(v, default: bool = False) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "y")
+        return default
+
+    def _as_int(v, default: int) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    mode = str(d.get("execution_mode", "parallel")).lower()
+    review_threshold = max(1, min(10, _as_int(d.get("review_threshold"), 7)))
+    max_fix = max(1, _as_int(d.get("max_fix_attempts"), 3))
+
+    return {
+        "pause_for_plan_approval": _as_bool(d.get("pause_for_plan_approval"), False),
+        "skip_build": _as_bool(d.get("skip_build"), False),
+        "skip_tests": _as_bool(d.get("skip_tests"), False),
+        "execution_mode": "sequential" if mode.startswith("seq") else "parallel",
+        "review_threshold": review_threshold,
+        "max_fix_attempts": max_fix,
+        "security_focus": _as_bool(d.get("security_focus"), False),
+        "notes": str(d.get("notes", "")),
+    }
+
+
+def _default_execution_plan(plan_mode: bool) -> dict:
+    return {
+        "pause_for_plan_approval": bool(plan_mode),
+        "skip_build": False,
+        "skip_tests": False,
+        "execution_mode": "parallel",
+        "review_threshold": 7,
+        "max_fix_attempts": 3,
+        "security_focus": False,
+        "notes": "Default full delivery plan (supervisor unavailable).",
+    }
+
+
+def supervisor_node(state: SoftwareState):
+    """Decide the delivery graph flow from the requirement.
+
+    Produces an :class:`ExecutionPlan` (stored as a dict in state) that the
+    graph routers consult to dynamically choose stages, strictness, and whether
+    to pause for plan approval before building.
+    """
+    print("--- SUPERVISOR: Deciding execution plan ---")
+    plan_mode = bool(state.get("plan_mode", False))
+    llms = _get_llms(state)
+    sup_llm = llms.get("supervisor")
+
+    if sup_llm is None:
+        print(f"   No supervisor LLM available; using default plan (plan_mode={plan_mode}).")
+        plan = _default_execution_plan(plan_mode)
+    else:
+        chain = supervisor_prompt() | sup_llm
+        try:
+            result = chain.invoke({
+                "requirement": state.get("requirement", ""),
+                "plan_mode": str(plan_mode),
+            })
+            if hasattr(result, "model_dump"):
+                raw = result.model_dump()
+            elif isinstance(result, dict):
+                raw = result
+            else:
+                raw = {}
+            plan = _flatten_execution_plan(raw)
+        except (OutputParserException, TypeError, ValueError, KeyError):
+            print("   Supervisor structured output failed; using default plan.")
+            plan = _default_execution_plan(plan_mode)
+
+    # Plan mode (opencode-style /plan toggle) always pauses for plan approval.
+    if plan_mode:
+        plan["pause_for_plan_approval"] = True
+
+    print(f"   Plan: mode={plan['execution_mode']} review>={plan['review_threshold']} "
+          f"pause={plan['pause_for_plan_approval']} skip_build={plan['skip_build']} "
+          f"skip_tests={plan['skip_tests']} security={plan['security_focus']}")
+    if plan.get("notes"):
+        print(f"   Notes: {plan['notes']}")
+
+    return {
+        "execution_plan": plan,
+        "execution_mode": plan["execution_mode"],
+        "review_threshold": plan["review_threshold"],
+        "max_fix_attempts": plan["max_fix_attempts"],
+        "skip_tests": plan["skip_tests"],
+        "security_focus": plan["security_focus"],
+    }
+
+
+def _parse_plan_decision(decision) -> tuple[str, str]:
+    """Extract (choice, feedback) from the resume value.
+
+    The CLI/`main.py` path resumes with ``{"choice": "yes", "feedback": ""}``,
+    while the wrapped assistant (REPL/server) routes the decision through the
+    outer agent's ``{"decisions": [{...}]}`` envelope, so accept both.
+    """
+    if isinstance(decision, dict):
+        choice = decision.get("choice")
+        feedback = decision.get("feedback", "") or ""
+        if choice is None and isinstance(decision.get("decisions"), list) and decision["decisions"]:
+            inner = decision["decisions"][0]
+            if isinstance(inner, dict):
+                choice = inner.get("choice")
+                feedback = inner.get("feedback", "") or ""
+        choice = str(choice or "").strip().lower()
+        feedback = str(feedback or "")
+        return choice, feedback
+    return str(decision or "").strip().lower(), ""
+
+
+def _format_plan(state: SoftwareState, plan: dict) -> str:
+    lines = []
+    stories = state.get("stories", []) or []
+    modules = state.get("modules", []) or []
+    arch = state.get("architecture", "") or ""
+    lines.append(f"Requirement: {state.get('requirement', '')}")
+    lines.append(f"Tech stack: {state.get('tech_stack', '')}")
+    lines.append(f"Modules ({len(modules)}): {', '.join(modules) if modules else '(none)'}")
+    if stories:
+        lines.append("User stories:")
+        for s in stories[:12]:
+            lines.append(f"  - {s}")
+    if arch:
+        snippet = arch.strip().splitlines()[:15]
+        lines.append("Architecture (excerpt):")
+        lines.extend(f"  {ln}" for ln in snippet)
+    lines.append(
+        f"Execution: {plan.get('execution_mode')} | review>={plan.get('review_threshold')} "
+        f"| tests={'skip' if plan.get('skip_tests') else 'run'} "
+        f"| security_focus={plan.get('security_focus')}"
+    )
+    return "\n".join(lines)
+
+
+def plan_review_node(state: SoftwareState):
+    """opencode-style plan gate.
+
+    If the supervisor (or plan mode) requested plan approval, surface the plan
+    and pause for the user. On approval, continue to build (or deliver a
+    plan-only result). On rejection, loop back to the planner with feedback.
+    """
+    plan = state.get("execution_plan") or {}
+
+    if not plan.get("pause_for_plan_approval", False):
+        # No approval requested (e.g. normal build) — pass straight through.
+        return {}
+
+    print("\n" + "=" * 60)
+    print("📋 PLAN REVIEW (approval required before building)")
+    print("=" * 60)
+    print(_format_plan(state, plan))
+
+    decision = interrupt({
+        "type": "plan_review",
+        "prompt": "Approve this plan before building? (yes/no): ",
+        "plan": _format_plan(state, plan),
+    })
+
+    if isinstance(decision, dict):
+        choice = str(decision.get("choice", "")).strip().lower()
+        feedback = decision.get("feedback", "") or ""
+    else:
+        choice = str(decision).strip().lower()
+        feedback = ""
+
+    if choice == "no":
+        print("   Plan rejected. Regenerating plan with feedback.")
+        return {
+            "plan_rejected": True,
+            "plan_approved": False,
+            "plan_reviews_completed": 1,
+            "human_feedback": feedback,
+            "pending_modules": list(state.get("modules", [])),
+            "completed_modules": [],
+            "generated_code": {},
+            "tests": {},
+        }
+
+    print("   Plan approved.")
+    return {"plan_rejected": False, "plan_approved": True, "plan_reviews_completed": 1}
 
 
 def project_init_node(state: SoftwareState):
@@ -738,6 +941,7 @@ def reviewer_node(state: SoftwareState):
             "tech_stack": tech_stack,
             "module": module,
             "code": code,
+            "security_focus": str(bool(state.get("security_focus", False))),
         })
     except (OutputParserException, TypeError, ValueError, KeyError):
         print("   Review structured output failed; attempting fallback...")
@@ -1443,9 +1647,20 @@ def project_analyzer_node(state: SoftwareState):
         })
     except (OutputParserException, TypeError, ValueError, KeyError):
         print("   Analyzer structured output failed; returning minimal analysis.")
+        analysis = ProjectAnalysis(
+            tech_stack=state.get("tech_stack", "Unknown"),
+            modules=list(existing_files.keys()),
+            missing_modules=[],
+            issues=[],
+            architecture_summary="",
+        )
         return {
-            "tech_stack": state.get("tech_stack", "Unknown"),
-            "modules": list(existing_files.keys()),
+            "tech_stack": analysis.tech_stack,
+            "modules": analysis.modules,
+            "analysis": analysis,
+            "stories": state.get("stories", []),
+            "pending_modules": analysis.modules,
+            "quality_guide": None,
         }
 
     print(f"   Detected stack: {analysis.tech_stack}")
@@ -1463,9 +1678,42 @@ def project_analyzer_node(state: SoftwareState):
     return {
         "tech_stack": analysis.tech_stack,
         "modules": analysis.modules + analysis.missing_modules,
+        "analysis": analysis,
         "stories": stories or state.get("stories", []),
         "pending_modules": analysis.missing_modules or analysis.modules,
         "quality_guide": None,
+    }
+
+
+def analysis_report_node(state: SoftwareState):
+    """Turn a `ProjectAnalysis` into a readable prose report (read-only).
+
+    Used by `analyze` mode so the pipeline reports on an existing project
+    instead of regenerating its code.
+    """
+    print("--- REPORT: Composing project analysis report ---")
+    analysis: Optional[ProjectAnalysis] = state.get("analysis")
+    if analysis is None:
+        return {
+            "delivery_package": "No analysis was produced for this project.",
+            "analysis_report": "No analysis was produced for this project.",
+        }
+
+    llms = _get_llms(state)
+    chain = analysis_report_prompt() | llms["llm"]
+
+    report = chain.invoke({
+        "tech_stack": analysis.tech_stack,
+        "modules": ", ".join(analysis.modules) or "(none detected)",
+        "missing_modules": ", ".join(analysis.missing_modules) or "(none)",
+        "issues": "\n".join(f"- {i}" for i in analysis.issues) or "(none)",
+        "architecture_summary": analysis.architecture_summary or "(no summary)",
+    })
+
+    text = report.content if hasattr(report, "content") else str(report)
+    return {
+        "delivery_package": text,
+        "analysis_report": text,
     }
 
 
@@ -1642,6 +1890,7 @@ def worker_reviewer(state: WorkerState) -> dict:
             "tech_stack": tech_stack,
             "module": module,
             "code": code,
+            "security_focus": str(bool(state.get("security_focus", False))),
         })
     except (OutputParserException, Exception) as exc:
         print(f"      * [{module}] Reviewer failed ({exc}); defaulting score=5.")
