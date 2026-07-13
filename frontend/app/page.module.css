@@ -1,0 +1,62 @@
+.statRow { margin-bottom: 32px; }
+
+.statCard {
+  padding: 18px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.statIcon { font-size: 24px; }
+.statLabel { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
+.statValue { font-size: 18px; font-weight: 700; }
+
+.section { margin-bottom: 32px; }
+
+.pipelineRow {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  position: relative;
+}
+
+.agentCard {
+  padding: 16px 14px;
+  text-align: center;
+  min-width: 110px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.agentIcon {
+  width: 44px; height: 44px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; margin: 0 auto 8px;
+}
+
+.agentName { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+.agentDesc { font-size: 10px; color: var(--text-muted); line-height: 1.4; }
+
+.arrow {
+  position: absolute; right: -10px; top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted); font-size: 14px; z-index: 1;
+}
+
+.listCards { display: flex; flex-direction: column; gap: 6px; }
+
+.listCard {
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.listIcon { font-size: 18px; flex-shrink: 0; }
+.listInfo { flex: 1; min-width: 0; }
+.listTitle { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.listSub { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.emptyCard { padding: 20px; color: var(--text-muted); font-size: 13px; text-align: center; }
+.link { color: var(--accent-hover); }

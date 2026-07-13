@@ -358,6 +358,7 @@ workflow.add_conditional_edges(
         "qa": "qa",
         "dispatcher": "dispatcher",
         "backend_lead": "backend_lead",
+        "delivery": "delivery",
     },
 )
 
@@ -392,7 +393,7 @@ workflow.add_conditional_edges(
     route_after_analyzer,
     {
         "analysis_report": "analysis_report",
-        "planner": "planner",
+        "supervisor": "supervisor",
     },
 )
 

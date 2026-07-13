@@ -1,0 +1,29 @@
+.empty { padding: 40px; text-align: center; color: var(--text-muted); }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+
+.projectCard { padding: 20px; display: flex; flex-direction: column; gap: 6px; }
+
+.cardTop { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+
+.projIcon { font-size: 24px; }
+
+.projName { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+
+.projPath { font-size: 11px; color: var(--text-muted); word-break: break-all; }
+
+.projMeta { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+.viewBtn { margin-top: 8px; font-size: 12px; padding: 6px 12px; align-self: flex-start; }
+
+.threadList { display: flex; flex-direction: column; gap: 8px; }
+
+.threadCard { padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+.threadLeft { display: flex; align-items: center; gap: 12px; min-width: 0; }
+
+.threadMsg { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 480px; }
+
+.threadId { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+.threadRight { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
