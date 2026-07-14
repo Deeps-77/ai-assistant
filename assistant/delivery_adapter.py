@@ -190,33 +190,25 @@ def build_delivery_subagent(cfg) -> CompiledSubAgent:
             result = dict(snapshot.values)
             result["__interrupt__"] = list(snapshot.interrupts or [])
 
-        # Number of plan-review gates the inner graph has already resolved. On a
-        # re-execution, ``interrupt()`` replays past decisions in order; we must
-        # skip re-applying those (they already advanced the inner graph) and only
-        # apply decisions the inner graph has not yet consumed.
-        applied = int((snapshot.values or {}).get("plan_reviews_completed", 0) or 0)
-
-        idx = 0
+        # Surface each pending inner-graph interrupt to the top-level human and
+        # resume the inner graph with their decision. There is exactly one
+        # pending interrupt per re-execution, so we always inject the human's
+        # decision here. (The previous logic tried to skip "already applied"
+        # gates via a counter that reset on every resume, which caused
+        # reject-then-approve flows to skip the inject and hang.)
         while True:
-            plan_value = _plan_review_value(result)
-            if plan_value is None:
+            interrupts = _interrupts(result)
+            if not interrupts:
                 break
-            # Surface the plan to the top-level human. This pauses the whole
+            # Surface the active interrupt to the top-level human. This pauses the whole
             # assistant; on resume the decision is returned here.
-            decision = interrupt(plan_value)
-            if idx >= applied:
-                choice, feedback = _parse_plan_decision(decision)
-                result = _isolated_invoke(
-                    Command(resume={"choice": choice, "feedback": feedback}),
-                    config=run_cfg,
-                )
-            idx += 1
-
-        # Auto-resolve any remaining (non plan-review) interrupts so the delivery
-        # sub-agent runs unattended; the top-level assistant still gates ops.
-        while _interrupts(result):
+            value = _interrupt_value(interrupts[0])
+            if not isinstance(value, dict):
+                value = {"type": "unknown", "data": value}
+            decision = interrupt(value)
+            choice, feedback = _parse_plan_decision(decision)
             result = _isolated_invoke(
-                Command(resume={"choice": "yes", "feedback": ""}),
+                Command(resume={"choice": choice, "feedback": feedback}),
                 config=run_cfg,
             )
 

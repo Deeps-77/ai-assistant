@@ -367,7 +367,9 @@ def extract_folder_structure_from_architecture(architecture: str) -> str:
 
 @tool
 def write_file_tool(filepath: str, content: str) -> str:
-    """Write content to a file at the given path. Creates parent directories if missing.
+    """Write content to a file at the given path, completely overwriting it.
+    Use this ONLY for creating new files or when a complete rewrite is necessary.
+    For small modifications, use edit_file_tool instead. Creates parent directories if missing.
 
     Args:
         filepath: Relative path to the file from the project root (e.g. "app/api/routes.py")
@@ -403,3 +405,50 @@ def read_file_tool(filepath: str) -> str:
         return f"Error: file not found: {filepath}"
     except Exception as e:
         return f"Error reading {filepath}: {e}"
+
+
+@tool
+def edit_file_tool(filepath: str, target_content: str, replacement_content: str) -> str:
+    """Edit an existing file by replacing a specific string with new content.
+    The target_content MUST exactly match an existing substring in the file.
+    
+    Args:
+        filepath: Relative path to the file to edit
+        target_content: The exact string (including whitespace) to replace
+        replacement_content: The new string to replace it with
+    """
+    try:
+        path = Path(filepath)
+        if not path.exists():
+            return f"Error: file not found: {filepath}"
+        
+        content = path.read_text(encoding="utf-8")
+        
+        if target_content not in content:
+            return f"Error: target_content not found in {filepath}. Please ensure exact whitespace matching."
+        
+        if content.count(target_content) > 1:
+            return f"Error: target_content occurs multiple times in {filepath}. Please provide a larger, unique target block."
+            
+        new_content = content.replace(target_content, replacement_content)
+        path.write_text(new_content, encoding="utf-8")
+        return f"Edited: {filepath}"
+    except Exception as e:
+        return f"Error editing {filepath}: {e}"
+
+
+@tool
+def delete_file_tool(filepath: str) -> str:
+    """Delete an existing file.
+    
+    Args:
+        filepath: Relative path to the file to delete
+    """
+    try:
+        path = Path(filepath)
+        if not path.exists():
+            return f"Error: file not found: {filepath}"
+        path.unlink()
+        return f"Deleted: {filepath}"
+    except Exception as e:
+        return f"Error deleting {filepath}: {e}"

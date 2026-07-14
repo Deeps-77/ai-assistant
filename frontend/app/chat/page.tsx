@@ -1,11 +1,14 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import Sidebar from "../components/Sidebar";
 import TopBar from "../components/TopBar";
 import AgentTimeline, { AgentStep } from "../components/AgentTimeline";
 import PlanReviewModal from "../components/PlanReviewModal";
-import { runDelivery, openStream, resumeDelivery } from "../lib/api";
+import HumanReviewModal from "../components/HumanReviewModal";
+import FileReviewModal from "../components/FileReviewModal";
+import { runDelivery, openStream, resumeDelivery, getHistory } from "../lib/api";
 import styles from "./page.module.css";
 
 type Role = "user" | "assistant" | "system";
@@ -21,37 +24,34 @@ const SUGGESTIONS = [
 let msgCounter = 0;
 const uid = () => `m${++msgCounter}`;
 
-export default function ChatPage() {
+function ChatContent() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [currentAgent, setCurrentAgent] = useState<string>("");
   const [liveSteps, setLiveSteps] = useState<AgentStep[]>([]);
-  const [planModal, setPlanModal] = useState<{ threadId: string; plan: string } | null>(null);
+  const [interruptModal, setInterruptModal] = useState<{ type: string; threadId: string; data: any } | null>(null);
   const [planMode, setPlanMode] = useState(false);
   const [projectPath, setProjectPath] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const closeStream = useRef<(() => void) | null>(null);
 
+  const searchParams = useSearchParams();
+  const queryThreadId = searchParams.get("thread_id");
+
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   const pushMsg = useCallback((msg: Message) => setMessages((p) => [...p, msg]), []);
-  const appendSteps = useCallback((steps: AgentStep[]) => setLiveSteps((p) => [...p, ...steps]), []);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if (!text || isRunning) return;
-    setInput("");
+  const connectStream = useCallback((threadId: string) => {
     setIsRunning(true);
     setLiveSteps([]);
     setCurrentAgent("Supervisor");
-    const userMsg: Message = { id: uid(), role: "user", content: text };
-    pushMsg(userMsg);
 
-    // Determine thread id upfront so we can open SSE before /run returns
-    const threadId = `chat-${Date.now().toString(36)}`;
+    if (closeStream.current) {
+      closeStream.current();
+    }
 
-    // Open SSE stream first
     closeStream.current = openStream(threadId, {
       onStep: (step) => {
         setCurrentAgent(step.agent);
@@ -60,29 +60,118 @@ export default function ChatPage() {
       onDone: (data) => {
         setIsRunning(false);
         setCurrentAgent("");
-        const reply: Message = {
-          id: uid(),
-          role: "assistant",
-          content: data.reply || "Delivery complete.",
-          steps: data.agent_steps,
-          threadId,
-        };
-        setMessages((p) => [...p, reply]);
+        setMessages((p) => [
+          ...p,
+          {
+            id: uid(),
+            role: "assistant",
+            content: data.reply || "Delivery complete.",
+            steps: data.agent_steps,
+            threadId,
+          },
+        ]);
         setLiveSteps([]);
       },
       onPaused: (data) => {
-        const intr = (data.interrupts as { plan?: string }[])[0];
-        const planText = intr?.plan || JSON.stringify(intr, null, 2);
-        setPlanModal({ threadId, plan: planText });
         setIsRunning(false);
         setCurrentAgent("");
+        const intr = (data.interrupts as any[])[0];
+        if (intr) {
+          setInterruptModal({ type: intr.type, threadId, data: intr });
+        }
       },
       onError: (msg) => {
         setIsRunning(false);
         setCurrentAgent("");
-        pushMsg({ id: uid(), role: "system", content: `⚠ ${msg}` });
+        setMessages((p) => [
+          ...p,
+          { id: uid(), role: "system", content: `⚠ ${msg}` },
+        ]);
       },
     });
+  }, []);
+
+  // Load thread history on mount or when queryThreadId changes
+  useEffect(() => {
+    if (!queryThreadId) {
+      setMessages([]);
+      setLiveSteps([]);
+      setIsRunning(false);
+      setInterruptModal(null);
+      return;
+    }
+
+    let active = true;
+
+    async function loadThread() {
+      try {
+        const history = await getHistory(queryThreadId);
+        if (!active) return;
+
+        const metadata = history.metadata || {};
+        const steps = history.agent_steps || [];
+
+        const loadedMessages: Message[] = [];
+        if (metadata.message) {
+          loadedMessages.push({
+            id: "user-msg",
+            role: "user",
+            content: metadata.message,
+          });
+        }
+
+        if (metadata.reply) {
+          loadedMessages.push({
+            id: "assistant-reply",
+            role: "assistant",
+            content: metadata.reply,
+            steps: steps,
+          });
+        }
+
+        setMessages(loadedMessages);
+        setLiveSteps(steps);
+        setProjectPath(metadata.project_path || "");
+        setPlanMode(metadata.plan_mode ?? false);
+
+        if (metadata.status === "paused" && metadata.interrupts && metadata.interrupts.length > 0) {
+          const intr = metadata.interrupts[0];
+          setInterruptModal({
+            type: intr.type,
+            threadId: queryThreadId,
+            data: intr,
+          });
+        }
+
+        if (metadata.status === "running") {
+          connectStream(queryThreadId);
+        }
+      } catch (err) {
+        console.error("Failed to load thread history:", err);
+      }
+    }
+
+    loadThread();
+
+    return () => {
+      active = false;
+      if (closeStream.current) {
+        closeStream.current();
+      }
+    };
+  }, [queryThreadId, connectStream]);
+
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    if (!text || isRunning) return;
+    setInput("");
+    
+    // Determine thread id upfront
+    const threadId = queryThreadId || `chat-${Date.now().toString(36)}`;
+    
+    const userMsg: Message = { id: uid(), role: "user", content: text };
+    pushMsg(userMsg);
+    connectStream(threadId);
 
     try {
       await runDelivery(text, threadId, projectPath || undefined, planMode);
@@ -91,35 +180,35 @@ export default function ChatPage() {
       setCurrentAgent("");
       pushMsg({ id: uid(), role: "system", content: `⚠ Could not reach backend. Is it running at port 8000?` });
     }
-  }, [input, isRunning, planMode, projectPath, pushMsg]);
+  }, [input, isRunning, planMode, projectPath, pushMsg, connectStream, queryThreadId]);
 
-  const handleApprove = async () => {
-    if (!planModal) return;
-    setPlanModal(null);
-    setIsRunning(true);
-    setCurrentAgent("Developer");
+  const handleApprove = useCallback(async () => {
+    if (!interruptModal) return;
+    const threadId = interruptModal.threadId;
+    setInterruptModal(null);
+    connectStream(threadId);
+    try {
+      await resumeDelivery(threadId, [{ choice: "yes", feedback: "" }]);
+    } catch (e) {
+      console.error(e);
+      setIsRunning(false);
+      setCurrentAgent("");
+    }
+  }, [interruptModal, connectStream]);
 
-    closeStream.current = openStream(planModal.threadId, {
-      onStep: (step) => { setCurrentAgent(step.agent); setLiveSteps((p) => [...p, step]); },
-      onDone: (data) => {
-        setIsRunning(false);
-        setCurrentAgent("");
-        pushMsg({ id: uid(), role: "assistant", content: data.reply || "Build complete.", steps: data.agent_steps, threadId: planModal.threadId });
-        setLiveSteps([]);
-      },
-      onPaused: () => { setIsRunning(false); },
-      onError: (msg) => { setIsRunning(false); pushMsg({ id: uid(), role: "system", content: `⚠ ${msg}` }); },
-    });
-
-    await resumeDelivery(planModal.threadId, [{ choice: "yes", feedback: "" }]);
-  };
-
-  const handleReject = async (feedback: string) => {
-    if (!planModal) return;
-    setPlanModal(null);
-    await resumeDelivery(planModal.threadId, [{ choice: "no", feedback }]);
-    pushMsg({ id: uid(), role: "system", content: "Plan rejected. Regenerating with your feedback…" });
-  };
+  const handleReject = useCallback(async (feedback: string) => {
+    if (!interruptModal) return;
+    const threadId = interruptModal.threadId;
+    setInterruptModal(null);
+    connectStream(threadId);
+    try {
+      await resumeDelivery(threadId, [{ choice: "no", feedback }]);
+    } catch (e) {
+      console.error(e);
+      setIsRunning(false);
+      setCurrentAgent("");
+    }
+  }, [interruptModal, connectStream]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
@@ -131,13 +220,14 @@ export default function ChatPage() {
       <div className="main-content">
         <TopBar
           title="Chat"
-          subtitle="Multi-agent software delivery"
+          subtitle={queryThreadId ? `Viewing run ${queryThreadId}` : "Multi-agent software delivery"}
           actions={
             <div className={styles.topActions}>
               <button
                 className={`btn ${planMode ? "btn-primary" : "btn-ghost"}`}
                 onClick={() => setPlanMode((p) => !p)}
                 title="Toggle plan mode (approve plan before building)"
+                disabled={isRunning}
               >
                 📋 {planMode ? "Plan Mode ON" : "Plan Mode"}
               </button>
@@ -203,6 +293,7 @@ export default function ChatPage() {
               placeholder="Project path (optional)"
               value={projectPath}
               onChange={(e) => setProjectPath(e.target.value)}
+              disabled={isRunning || !!queryThreadId}
             />
           </div>
           <div className={styles.inputBox}>
@@ -225,9 +316,32 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {planModal && (
-        <PlanReviewModal plan={planModal.plan} onApprove={handleApprove} onReject={handleReject} />
+      {interruptModal && interruptModal.type === "plan_review" && (
+        <PlanReviewModal plan={interruptModal.data?.plan || JSON.stringify(interruptModal.data, null, 2)} onApprove={handleApprove} onReject={handleReject} />
+      )}
+      {interruptModal && interruptModal.type === "human_review" && (
+        <HumanReviewModal data={interruptModal.data} onApprove={handleApprove} onReject={handleReject} />
+      )}
+      {interruptModal && interruptModal.type === "file_review" && (
+        <FileReviewModal data={interruptModal.data} onApprove={handleApprove} onReject={handleReject} />
       )}
     </div>
+  );
+}
+
+export default function ChatPage() {
+  return (
+    <Suspense fallback={
+      <div className="layout">
+        <Sidebar />
+        <div className="main-content">
+          <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: "100%" }}>
+            <p>Loading Chat Session...</p>
+          </div>
+        </div>
+      </div>
+    }>
+      <ChatContent />
+    </Suspense>
   );
 }

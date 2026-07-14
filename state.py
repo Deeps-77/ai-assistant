@@ -128,6 +128,8 @@ class WorkerState(TypedDict):
     llm_base_url: str
     llm_model: str
     max_retries: int
+    adaptive_threshold: bool
+    security_focus: bool
     module_plan: Optional[str]
     generated_code: Dict[str, str]
     tests: Dict[str, str]
@@ -142,7 +144,13 @@ class WorkerState(TypedDict):
     human_approved: bool
     human_feedback: str
 
+    pending_tool_calls: List[Dict[str, Any]]
+    file_review_approved: bool
+    file_review_feedback: str
+
     completed_modules: List[str]
+    plan_reviews_completed: Optional[int]
+
 
 
 # Per-module sandbox worker state
@@ -215,6 +223,10 @@ class SoftwareState(TypedDict):
 
     human_approved: bool
     human_feedback: str
+
+    pending_tool_calls: List[Dict[str, Any]]
+    file_review_approved: bool
+    file_review_feedback: str
 
     # Supervisor-decided flow controls (set by supervisor_node)
     skip_tests: bool                          # skip the QA / test stage

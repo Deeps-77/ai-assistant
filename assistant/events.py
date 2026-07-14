@@ -13,8 +13,11 @@ import json
 import time
 from typing import AsyncIterator
 
-# Global registry: thread_id -> Queue of SSE event dicts
-_queues: dict[str, asyncio.Queue] = {}
+# Global registry: thread_id -> (Queue of SSE event dicts, owning event loop).
+# The event loop is captured when the queue is created (in the async /stream
+# handler) so that emit helpers running on a worker thread can safely schedule
+# puts on the correct loop via loop.call_soon_threadsafe.
+_queues: dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
 
 # Sentinel to signal stream end
 _DONE = object()
@@ -22,8 +25,9 @@ _DONE = object()
 
 def get_or_create_queue(thread_id: str) -> asyncio.Queue:
     if thread_id not in _queues:
-        _queues[thread_id] = asyncio.Queue()
-    return _queues[thread_id]
+        loop = asyncio.get_running_loop()
+        _queues[thread_id] = (asyncio.Queue(), loop)
+    return _queues[thread_id][0]
 
 
 def remove_queue(thread_id: str) -> None:
@@ -84,13 +88,20 @@ def emit_paused(thread_id: str, interrupts: list) -> None:
 
 
 def _put_nowait(thread_id: str, item) -> None:
-    """Put an item into the queue. Creates the queue if missing."""
-    q = _queues.get(thread_id)
-    if q is None:
+    """Put an item into the queue from any thread (thread-safe).
+
+    Emit helpers are called from worker threads (e.g. via
+    ``loop.run_in_executor``), so we must marshal the put onto the event loop
+    that owns the queue instead of calling ``Queue.put_nowait`` directly.
+    """
+    entry = _queues.get(thread_id)
+    if entry is None:
         return
+    q, loop = entry
     try:
-        q.put_nowait(item)
-    except asyncio.QueueFull:
+        loop.call_soon_threadsafe(q.put_nowait, item)
+    except RuntimeError:
+        # Loop is closed; drop the event.
         pass
 
 

@@ -122,7 +122,7 @@ export default function Dashboard() {
               ) : (
                 <div className={styles.listCards}>
                   {threads.map((t) => (
-                    <div key={t.thread_id} className={`card ${styles.listCard}`}>
+                    <Link key={t.thread_id} href={`/chat?thread_id=${t.thread_id}`} className={`card ${styles.listCard}`} style={{ textDecoration: "none", cursor: "pointer" }}>
                       <span className={styles.listIcon}>🔄</span>
                       <div className={styles.listInfo}>
                         <p className={styles.listTitle}>{t.message?.slice(0, 50) || t.thread_id}</p>
@@ -131,7 +131,7 @@ export default function Dashboard() {
                       <span className={`badge ${t.status === "done" ? "badge-success" : t.status === "running" ? "badge-info" : "badge-muted"}`}>
                         {t.status || "done"}
                       </span>
-                    </div>
+                    </Link>
                   ))}
                 </div>
               )}

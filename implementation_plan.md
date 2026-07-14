@@ -1,162 +1,84 @@
-# Multi-Agent Software Delivery Assistant — Alignment & Next.js Frontend
+# Upgrade File Tools & Implement HITL File Review
 
-## Background
+The current implementation executes file modifications synchronously within the agent nodes using `write_file_tool`, which overwrites the entire file. This plan details the transition to a true agentic tool-calling architecture, introducing precise file editing tools and a Human-in-the-Loop (HITL) approval step before any disk modifications occur.
 
-The problem statement describes a **Multi-Agent Software Delivery Assistant** — an enterprise-grade AI platform where specialized agents (Planner, Developer, Reviewer, Tester, Manager, Communicator) collaborate via LangGraph to automate the SDLC.
+## User Review Required
 
-The current Python/FastAPI backend is already **very well-aligned** with the problem statement. It has:
-- ✅ Supervisor agent deciding graph flow (like deep-agent in LangChain)
-- ✅ Plan mode / Build mode (like opencode)
-- ✅ Planner, Developer (module coder), Reviewer, Tester (QA), Manager (delivery/analysis report) agents
-- ✅ LangGraph orchestration with parallel/sequential execution
-- ✅ Human-in-the-loop approvals
-- ✅ Interactive REPL + HTTP server (FastAPI)
+> [!IMPORTANT]
+> **Workflow Interruption**: Implementing this will pause the workflow *every time* an agent wants to write or edit a file, requiring the user to explicitly approve the change on the frontend. Do you want this enabled globally, or should it be a toggleable feature (e.g., "Auto-Approve Edits")?
 
-## Gaps vs. Problem Statement
+## Open Questions
 
-| Gap | Priority | What to do |
-|-----|----------|------------|
-| No explicit **Communicator/Manager agent** node returning progress updates to the frontend | High | Add `manager_node` streaming progress events + SSE endpoint |
-| HTTP API only exposes `/run` and `/resume` — no **streaming** or **SSE** for real-time agent step events | High | Add `/stream` SSE endpoint that streams node events |
-| No **project/thread management** endpoints (list projects, get history) | Medium | Add `/projects`, `/threads`, `/history` endpoints |
-| Frontend is just a CLI/REPL, no Next.js app | High | Build a full Next.js 14 (App Router) frontend |
-| No agent-specific status reporting (which agent is active, current task) | Medium | Emit agent-step events via SSE |
-| Missing `Communicator Agent` role (though REPL/server does some of this) | Low | Wire communicator into server responses |
+> [!WARNING]
+> 1. **Edit Strategy**: Should the `edit_file_tool` use a **String Replace** strategy (providing exact target string and replacement) or a **Line Range Replace** strategy (start line, end line, new content)? *String replace is generally safer for LLMs to avoid line number drift.*
+> 2. **Frontend Diffing**: To show a diff on the frontend, the backend needs to send the current file content and the proposed edits. Are you comfortable with using a library like `diff` on the frontend, or should the backend pre-compute the diff string?
 
 ## Proposed Changes
 
 ---
 
-### 1. Backend — Enhanced FastAPI Server (`assistant/server.py`)
+### Backend: File Tools
 
-#### [MODIFY] [server.py](file:///d:/Indium/ai-assistant/assistant/server.py)
-
-- Add **SSE streaming endpoint** `/stream` that streams agent step events (agent name, status, partial output) using `text/event-stream`
-- Add CORS middleware for the Next.js frontend (`localhost:3000`)
-- Add `/threads` (list active threads) and `/history/{thread_id}` (get message history)
-- Add `/projects` endpoint listing known project paths
-- Return richer JSON with `agent_steps` array showing each agent's contribution
-
----
-
-### 2. Backend — Manager Agent node (`agents.py` or new file)
-
-#### [MODIFY] [agents.py](file:///d:/Indium/ai-assistant/agents.py)
-
-- Add a **`manager_node`** that collects completed modules, test results, review scores, and produces a structured **progress report** (like the problem statement's Manager Agent dashboard)
-- Wire it into `graph.py` after delivery
+#### [MODIFY] `file_tools.py`
+- Refactor `write_file_tool` to explicitly state it is for *creating new files* or *full overwrites*.
+- **[NEW]** Add `edit_file_tool(filepath: str, target_content: str, replacement_content: str)`:
+  - Validates that `target_content` exists in the file.
+  - Replaces `target_content` with `replacement_content`.
+  - Returns clear error messages if the target string is not found or is ambiguous (multiple matches).
+- **[NEW]** Add `delete_file_tool(filepath: str)`.
+- Ensure all tools are registered and available to the `tool_llm` binding.
 
 ---
 
-### 3. Backend — SSE Event Emitter (`assistant/events.py`) [NEW]
+### Backend: Agent Execution & Graph
 
-#### [NEW] events.py
+#### [MODIFY] `agents.py`
+- Remove the synchronous `_execute_tool_calls` logic from `worker_coder` and `worker_fixer`.
+- Update agents to return the generated `tool_calls` in the state rather than executing them.
+- Introduce a mechanism to format rejected tool calls as `ToolMessage`s so the LLM can correct its formatting or logic in the next iteration.
 
-- A lightweight pub-sub or queue-based event system so graph nodes can emit events (e.g., `{"agent": "planner", "status": "running", "message": "Analyzing requirements..."}`)
-- Used by the `/stream` SSE endpoint to push real-time updates to the Next.js frontend
+#### [MODIFY] `state.py`
+- Add `pending_tool_calls: list[dict]` to `WorkerState` and `SoftwareState`.
+- Add `file_review_approved: bool` and `file_review_feedback: str` to handle the user's decision.
 
----
-
-### 4. Frontend — Next.js 14 App Router Application
-
-A brand-new Next.js 14 app in `frontend/` directory with:
-
-#### Pages / Routes
-
-| Route | Description |
-|-------|-------------|
-| `/` | Landing / Dashboard — shows recent projects, system status |
-| `/chat` | Main AI chat interface — like VS Code Copilot / Antigravity |
-| `/projects/[id]` | Project detail — generated files, modules, agent steps |
-| `/analytics` | Manager Agent dashboard — charts for tasks, test results, reviews |
-
-#### Key Components
-
-- **`ChatPanel`** — VSCode-like chat sidebar with message history, streaming AI responses
-- **`AgentTimeline`** — Real-time view of which agent is active (Planner → Developer → Reviewer → Tester → Manager)
-- **`CodeViewer`** — Syntax-highlighted code viewer for generated files
-- **`PlanReviewModal`** — Modal to approve/reject plans (opencode-style)
-- **`ProjectExplorer`** — File tree of generated project
-- **`ManagerDashboard`** — Cards showing task progress, module status, test results
-
-#### Tech choices
-
-- **Next.js 14** App Router
-- **TypeScript**
-- **Vanilla CSS** (custom design system — dark mode, glassmorphism)
-- **Server-Sent Events** (native `EventSource` API) for real-time streaming
-- **Google Fonts** — Inter
+#### [MODIFY] `graph.py`
+- Add a new **`file_review_node`**: A dummy node that acts as an interrupt breakpoint. LangGraph will pause execution here if `pending_tool_calls` exist.
+- Add a new **`tool_executor_node`**: Iterates through approved `pending_tool_calls` and actually executes the python functions from `file_tools.py`, applying changes to the file system.
+- Update the `worker_graph` routing:
+  - `worker_coder` -> `file_review_node`
+  - `file_review_node` -> `tool_executor_node` (if approved) -> `worker_reviewer`
+  - `file_review_node` -> `worker_coder` (if rejected, feeding back the user's rejection reason).
+  - Apply the exact same loop for `worker_fixer`.
 
 ---
 
-### 5. API Contract (Backend → Frontend)
+### Frontend: Next.js UI
 
-#### `POST /run`
-```json
-{
-  "message": "Build a Login API with JWT",
-  "thread_id": "optional-thread-id",
-  "project_path": "/path/to/project"
-}
-```
-Response:
-```json
-{
-  "status": "done",
-  "thread_id": "srv-abc123",
-  "reply": "Delivery complete. 5 modules, 18 files...",
-  "agent_steps": [
-    {"agent": "supervisor", "status": "done", "message": "Execution plan decided"},
-    {"agent": "planner", "status": "done", "message": "6 modules planned"},
-    ...
-  ]
-}
-```
+#### [MODIFY] `frontend/app/chat/page.tsx`
+- Detect when the agent is paused at `file_review_node`.
+- Extract the `pending_tool_calls` from the state.
+- **[NEW] `FileDiffViewer` Component**:
+  - Displays the proposed file changes. For `write_file_tool`, it shows the full new file. For `edit_file_tool`, it calculates and displays an inline or side-by-side diff.
+- Add **Approve** and **Reject** buttons.
+- On Reject, prompt the user for feedback (e.g., "The import path is wrong, please fix").
+- Submit the decision via `POST /api/resume` with `{ file_review_approved: true/false, file_review_feedback: "..." }`.
 
-#### `GET /stream?thread_id=xxx`  (SSE)
-Streams events:
-```
-event: agent_step
-data: {"agent": "planner", "status": "running", "message": "Analyzing requirements..."}
-
-event: agent_step  
-data: {"agent": "developer", "status": "done", "message": "Module auth coded (score 8/10)"}
-
-event: done
-data: {"reply": "...", "thread_id": "..."}
-```
-
-#### `GET /history/{thread_id}`
-Returns message history for a thread.
-
-#### `GET /projects`
-Returns list of known projects with their threads.
+#### [NEW] `HumanReviewModal` & Pause Handling Fix
+- Currently, `page.tsx` blindly renders a `PlanReviewModal` on *any* pause (even for `human_review_node`).
+- **Fix `onPaused` handler**: Inspect `data.interrupts[0].type`. If it's `plan_review`, show `PlanReviewModal`. If it's `human_review`, show a new `HumanReviewModal`. If it's `file_review`, show the `FileDiffViewer`.
+- **Create `HumanReviewModal`**: Displays the `completed_modules` list and asks the user to "Approve Project?" before proceeding to QA and delivery.
 
 ---
 
 ## Verification Plan
 
-### Backend
-- Run `uvicorn assistant.server:app --reload` and test all new endpoints with curl/Postman
-- Test SSE with `curl -N http://localhost:8000/stream?thread_id=xxx`
-- Ensure existing `/run` and `/resume` still work
+### Automated Tests
+- Run `pytest tests/` to ensure existing graph paths and fallback logic still hold.
+- Write unit tests for `edit_file_tool` to verify exact string replacement handles edge cases (e.g., missing whitespace, non-existent target strings).
 
-### Frontend
-- `npm run dev` and verify all pages render
-- Test chat → SSE streaming → real-time agent timeline update
-- Test plan approval modal flow
-- Test on different screen sizes
-
-## Open Questions
-
-> [!IMPORTANT]
-> **1. Next.js location**: Should the frontend be at `d:\Indium\ai-assistant\frontend\` (monorepo) or a separate directory?
-
-> [!IMPORTANT]  
-> **2. LLM Provider for the frontend API**: The backend currently talks to Ollama/LM Studio. Should the Next.js frontend connect directly to `localhost:8000` (FastAPI) or do you want Next.js API routes as a BFF (Backend for Frontend)?
-
-> [!NOTE]
-> **3. Authentication**: The problem statement mentions Role-Based Access Control. Should we stub out auth (JWT login page) or skip it for now?
-
-> [!NOTE]
-> **4. Database**: The problem statement mentions PostgreSQL for storing projects/tasks/logs. Should we add a database layer, or keep the current in-memory approach for now?
+### Manual Verification
+1. Start the chat UI and request a small code change to an existing file.
+2. Verify the pipeline pauses at the new `file_review_node`.
+3. Verify the frontend displays the correct file diff.
+4. **Reject** the change with feedback and verify the agent regenerates the tool call.
+5. **Approve** the change and verify the file is successfully modified on disk, and the pipeline continues to the reviewer node.

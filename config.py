@@ -49,8 +49,8 @@ class WorkflowConfig(BaseModel):
         import yaml
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        data.pop("mode", None)
-        return cls(mode=WorkflowMode(data["mode"]), **{k: v for k, v in data.items() if k != "mode"})
+        mode_val = data.pop("mode", "create_new")
+        return cls(mode=WorkflowMode(mode_val), **{k: v for k, v in data.items() if k != "mode"})
 
     @classmethod
     def from_json(cls, path: str) -> "WorkflowConfig":

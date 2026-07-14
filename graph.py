@@ -35,6 +35,8 @@ from agents import (
     worker_reviewer,
     worker_fixer,
     worker_complete,
+    file_review_node,
+    tool_executor_node,
     sandbox_worker_node,
 )
 
@@ -166,13 +168,34 @@ worker_builder = StateGraph(WorkerState)
 
 worker_builder.add_node("worker_module_planner", trace_node("worker_module_planner")(worker_module_planner))
 worker_builder.add_node("worker_coder", trace_node("worker_coder")(worker_coder))
+worker_builder.add_node("worker_file_review_node", trace_node("file_review_node")(file_review_node))
+worker_builder.add_node("worker_tool_executor_node", trace_node("tool_executor_node")(tool_executor_node))
 worker_builder.add_node("worker_reviewer", trace_node("worker_reviewer")(worker_reviewer))
 worker_builder.add_node("worker_fixer", trace_node("worker_fixer")(worker_fixer))
 worker_builder.add_node("worker_complete", trace_node("worker_complete")(worker_complete))
 
 worker_builder.set_entry_point("worker_module_planner")
 worker_builder.add_edge("worker_module_planner", "worker_coder")
-worker_builder.add_edge("worker_coder", "worker_reviewer")
+worker_builder.add_edge("worker_coder", "worker_file_review_node")
+
+def route_worker_after_file_review(state: WorkerState):
+    if state.get("file_review_approved", True):
+        return "worker_tool_executor_node"
+    if state.get("fix_attempts", 0) > 0:
+        return "worker_fixer"
+    return "worker_coder"
+
+worker_builder.add_conditional_edges(
+    "worker_file_review_node",
+    route_worker_after_file_review,
+    {
+        "worker_tool_executor_node": "worker_tool_executor_node",
+        "worker_fixer": "worker_fixer",
+        "worker_coder": "worker_coder",
+    }
+)
+
+worker_builder.add_edge("worker_tool_executor_node", "worker_reviewer")
 
 worker_builder.add_conditional_edges(
     "worker_reviewer",
@@ -183,7 +206,7 @@ worker_builder.add_conditional_edges(
     },
 )
 
-worker_builder.add_edge("worker_fixer", "worker_reviewer")
+worker_builder.add_edge("worker_fixer", "worker_file_review_node")
 worker_builder.add_edge("worker_complete", END)
 
 worker_graph = worker_builder.compile()
@@ -338,6 +361,8 @@ workflow.add_node("project_init", trace_node("project_init")(project_init_node))
 workflow.add_node("backend_lead", trace_node("backend_lead")(backend_lead_node))
 workflow.add_node("module_planner", trace_node("module_planner")(module_planner_node))
 workflow.add_node("module_coder", trace_node("module_coder")(module_coder_node))
+workflow.add_node("file_review_node", trace_node("file_review_node")(file_review_node))
+workflow.add_node("tool_executor_node", trace_node("tool_executor_node")(tool_executor_node))
 workflow.add_node("reviewer", trace_node("reviewer")(reviewer_node))
 workflow.add_node("fixer", trace_node("fixer")(fixer_node))
 workflow.add_node("complete_module", trace_node("complete_module")(complete_module_node))
@@ -467,7 +492,26 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_edge("module_planner", "module_coder")
-workflow.add_edge("module_coder", "reviewer")
+workflow.add_edge("module_coder", "file_review_node")
+
+def route_after_file_review(state: SoftwareState):
+    if state.get("file_review_approved", True):
+        return "tool_executor_node"
+    if state.get("fix_attempts", 0) > 0:
+        return "fixer"
+    return "module_coder"
+
+workflow.add_conditional_edges(
+    "file_review_node",
+    route_after_file_review,
+    {
+        "tool_executor_node": "tool_executor_node",
+        "fixer": "fixer",
+        "module_coder": "module_coder",
+    }
+)
+
+workflow.add_edge("tool_executor_node", "reviewer")
 
 workflow.add_conditional_edges(
     "reviewer",
@@ -478,7 +522,7 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge("fixer", "reviewer")
+workflow.add_edge("fixer", "file_review_node")
 workflow.add_edge("complete_module", "backend_lead")
 
 # ─── QA + Sandbox (shared, parallel sandbox) ────────────────

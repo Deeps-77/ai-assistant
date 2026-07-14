@@ -271,12 +271,17 @@ def create_app() -> FastAPI:
     @app.post("/run")
     async def run(req: ChatRequest):
         """Start a delivery run. Returns the result synchronously (or 202 if paused)."""
-        cfg = resolve_assistant_config(req.project_path)
+        thread_id = req.thread_id or f"srv-{uuid.uuid4().hex[:8]}"
+        project_path = req.project_path
+        if _HAS_DB and req.thread_id:
+            thread = _db.get_thread(req.thread_id)
+            if thread and thread.get("project_path"):
+                project_path = thread.get("project_path")
+        cfg = resolve_assistant_config(project_path)
         if req.plan_mode:
             import os
             os.environ["ASSISTANT_PLAN_MODE"] = "1"
 
-        thread_id = req.thread_id or f"srv-{uuid.uuid4().hex[:8]}"
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 400}
 
         # Register a queue so /stream can receive events for this thread
@@ -322,7 +327,12 @@ def create_app() -> FastAPI:
     @app.post("/resume")
     async def resume(req: ResumeRequest):
         """Resume a paused (human-in-the-loop) thread."""
-        cfg = resolve_assistant_config()
+        project_path = None
+        if _HAS_DB and req.thread_id:
+            thread = _db.get_thread(req.thread_id)
+            if thread and thread.get("project_path"):
+                project_path = thread.get("project_path")
+        cfg = resolve_assistant_config(project_path)
         agent = build_assistant(cfg=cfg, checkpointer=_CHECKPOINTER)
         config = {"configurable": {"thread_id": req.thread_id}, "recursion_limit": 400}
 

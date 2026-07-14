@@ -55,20 +55,20 @@ export default function ProjectsPage() {
                     <p className={styles.projPath}>{p.project_path}</p>
                     <p className={styles.projMeta}>Updated: {fmt(p.updated_at)}</p>
                     {p.thread_id && (
-                      <Link href={`/chat`} className={`btn btn-ghost ${styles.viewBtn}`}>View in Chat →</Link>
+                      <Link href={`/chat?thread_id=${p.thread_id}`} className={`btn btn-ghost ${styles.viewBtn}`}>View in Chat →</Link>
                     )}
                   </div>
                 ))}
               </div>
             )}
           </section>
-
+ 
           <section>
             <p className="section-title">All Runs ({threads.length})</p>
             <div className={styles.threadList}>
               {loading ? [1,2,3,4].map(i => <div key={i} className="skeleton" style={{ height: 56 }} />) :
                threads.map((t) => (
-                <div key={t.thread_id} className={`card ${styles.threadCard}`}>
+                <Link key={t.thread_id} href={`/chat?thread_id=${t.thread_id}`} className={`card ${styles.threadCard}`} style={{ textDecoration: "none", cursor: "pointer" }}>
                   <div className={styles.threadLeft}>
                     <span className={`dot dot-${t.status === "done" ? "success" : t.status === "running" ? "running" : "idle"}`} />
                     <div>
@@ -84,7 +84,7 @@ export default function ProjectsPage() {
                       {t.status || "done"}
                     </span>
                   </div>
-                </div>
+                </Link>
               ))}
             </div>
           </section>
