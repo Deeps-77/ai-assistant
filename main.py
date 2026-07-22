@@ -1,9 +1,13 @@
-"""
-DevSwarm – AI-driven multi-agent software delivery platform.
-Entry point: launches the terminal CLI shell.
-"""
 
-from src.devswarm.cli.shell import main
+from __future__ import annotations
+
+from src.devswarm.ui.app import DevSwarmApp
+
+
+def main() -> None:
+    app = DevSwarmApp()
+    app.run()
+
 
 if __name__ == "__main__":
     main()
