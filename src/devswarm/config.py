@@ -28,6 +28,12 @@ class Settings:
     ollama_base_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "https://ollama.com")
     )
+    ollama_num_ctx: int = field(
+        default_factory=lambda: int(os.getenv("OLLAMA_NUM_CTX", "32768"))
+    )
+    ollama_num_predict: int = field(
+        default_factory=lambda: int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
+    )
 
     # Workspace
     workspaces_root: Path = field(
@@ -51,6 +57,9 @@ class Settings:
     )
     max_agent_iterations: int = field(
         default_factory=lambda: int(os.getenv("DEVSWARM_MAX_ITERATIONS", "20"))
+    )
+    max_review_attempts: int = field(
+        default_factory=lambda: int(os.getenv("DEVSWARM_MAX_REVIEW_ATTEMPTS", "3"))
     )
 
     # LangGraph

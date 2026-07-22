@@ -15,6 +15,8 @@ from devswarm.graph.nodes import (
     orchestrator_node,
     planner_node,
     hitl_node,
+    hitl_after_coder_node,
+    hitl_after_reviewer_node,
     coder_node,
     reviewer_node,
     tester_node,
@@ -46,21 +48,43 @@ def _route_from_hitl(
 
 def _route_from_coder(
     state: DevSwarmState,
-) -> Literal["reviewer", "__end__"]:
+) -> Literal["hitl_after_coder", "__end__"]:
+    next_a = state.get("next_agent", "done")
+    if next_a == "hitl_after_coder":
+        return "hitl_after_coder"
+    return END
+
+
+def _route_from_hitl_after_coder(
+    state: DevSwarmState,
+) -> Literal["reviewer", "planner", "__end__"]:
     next_a = state.get("next_agent", "done")
     if next_a == "reviewer":
         return "reviewer"
+    if next_a == "planner":
+        return "planner"
     return END
 
 
 def _route_from_reviewer(
     state: DevSwarmState,
-) -> Literal["tester", "coder", "__end__"]:
+) -> Literal["hitl_after_reviewer", "coder", "__end__"]:
+    next_a = state.get("next_agent", "done")
+    if next_a == "hitl_after_reviewer":
+        return "hitl_after_reviewer"
+    if next_a == "coder":
+        return "coder"
+    return END
+
+
+def _route_from_hitl_after_reviewer(
+    state: DevSwarmState,
+) -> Literal["tester", "planner", "__end__"]:
     next_a = state.get("next_agent", "done")
     if next_a == "tester":
         return "tester"
-    if next_a == "coder":
-        return "coder"
+    if next_a == "planner":
+        return "planner"
     return END
 
 
@@ -81,6 +105,8 @@ def build_graph() -> StateGraph:
     builder.add_node("orchestrator", orchestrator_node)
     builder.add_node("planner", planner_node)
     builder.add_node("hitl", hitl_node)
+    builder.add_node("hitl_after_coder", hitl_after_coder_node)
+    builder.add_node("hitl_after_reviewer", hitl_after_reviewer_node)
     builder.add_node("coder", coder_node)
     builder.add_node("reviewer", reviewer_node)
     builder.add_node("tester", tester_node)
@@ -98,6 +124,8 @@ def build_graph() -> StateGraph:
             "reviewer": "reviewer",
             "tester": "tester",
             "hitl": "hitl",
+            "hitl_after_coder": "hitl_after_coder",
+            "hitl_after_reviewer": "hitl_after_reviewer",
             END: END,
         },
     )
@@ -105,25 +133,37 @@ def build_graph() -> StateGraph:
     # ── Planner always goes to hitl (plan approval required) ──────────────────
     builder.add_edge("planner", "hitl")
 
-    # ── HITL conditional routing ───────────────────────────────────────────────
+    # ── HITL (after plan) conditional routing ─────────────────────────────────
     builder.add_conditional_edges(
         "hitl",
         _route_from_hitl,
         {"planner": "planner", "coder": "coder", END: END},
     )
 
-    # ── Coder → Reviewer ──────────────────────────────────────────────────────
+    # ── Coder → HITL (code approval) → Reviewer ──────────────────────────────
     builder.add_conditional_edges(
         "coder",
         _route_from_coder,
-        {"reviewer": "reviewer", END: END},
+        {"hitl_after_coder": "hitl_after_coder", END: END},
     )
 
-    # ── Reviewer → Tester or back to Coder ────────────────────────────────────
+    builder.add_conditional_edges(
+        "hitl_after_coder",
+        _route_from_hitl_after_coder,
+        {"reviewer": "reviewer", "planner": "planner", END: END},
+    )
+
+    # ── Reviewer → HITL (test approval) → Tester, or back to Coder ───────────
     builder.add_conditional_edges(
         "reviewer",
         _route_from_reviewer,
-        {"tester": "tester", "coder": "coder", END: END},
+        {"hitl_after_reviewer": "hitl_after_reviewer", "coder": "coder", END: END},
+    )
+
+    builder.add_conditional_edges(
+        "hitl_after_reviewer",
+        _route_from_hitl_after_reviewer,
+        {"tester": "tester", "planner": "planner", END: END},
     )
 
     # ── Tester → next task Coder or done ──────────────────────────────────────
@@ -141,5 +181,5 @@ _checkpointer = MemorySaver()
 
 compiled_graph = build_graph().compile(
     checkpointer=_checkpointer,
-    interrupt_before=["hitl"],
+    interrupt_before=["hitl", "hitl_after_coder", "hitl_after_reviewer"],
 )

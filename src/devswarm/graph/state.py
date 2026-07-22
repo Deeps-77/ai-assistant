@@ -76,3 +76,6 @@ class DevSwarmState(TypedDict):
 
     # Tool call counter (budget)
     tool_calls_used: int
+
+    # Review loop counter (max attempts before blocking a task)
+    review_attempts: int

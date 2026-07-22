@@ -54,13 +54,40 @@ def run_reviewer(task: PlanTask, workspace: str, coder_summary: str = "") -> dic
 
     # Read a snapshot of text files (limit to keep context manageable)
     file_contents = {}
+    all_paths: list[str] = []
     if file_list and file_list != "(empty workspace)":
-        paths = [p.strip() for p in file_list.splitlines() if p.strip()]
-        for p in paths[:20]:  # cap at 20 files
-            ext = p.rsplit(".", 1)[-1] if "." in p else ""
-            if ext in ("py", "js", "ts", "go", "java", "md", "toml", "yaml", "yml", "json", "sh"):
-                content = read_file.invoke({"workspace": workspace, "path": p})
-                file_contents[p] = content[:3000]  # cap per file
+        all_paths = [p.strip() for p in file_list.splitlines() if p.strip()]
+
+    TEXT_EXTS = {
+        "py", "pyi", "pyx", "pxd",          # Python
+        "js", "jsx", "mjs", "cjs",           # JavaScript
+        "ts", "tsx", "mts", "cts",           # TypeScript
+        "go", "java", "rs", "rb", "php",     # Backend languages
+        "c", "cpp", "cc", "cxx", "h", "hpp", "hxx",  # C/C++
+        "cs", "fs", "swift", "kt", "scala",  # Other compiled
+        "sql", "graphql", "prisma", "mig",   # Data/query
+        "html", "htm", "xhtml", "css", "scss", "sass", "less",  # Web
+        "xml", "json", "yaml", "yml", "toml", "ini", "cfg", "conf",  # Config
+        "md", "rst", "txt", "log",           # Docs
+        "sh", "bash", "zsh", "ps1", "bat", "cmd",  # Shell
+        "env", "gitignore", "dockerfile", "makefile", "procfile",  # DevOps
+        "lock", "gradle", "sbt", "cmake",    # Build
+        "svg", "tex", "bib",                 # Misc text
+    }
+
+    for p in all_paths[:30]:  # cap at 30 files
+        ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
+        if ext in TEXT_EXTS:
+            content = read_file.invoke({"workspace": workspace, "path": p})
+            file_contents[p] = content[:6000]  # cap per file
+
+    # Include full listing so the LLM knows what exists even if unread
+    listing_hint = (
+        f"\n\nAll workspace files ({len(all_paths)} total):\n"
+        + "\n".join(f"  {p}" for p in all_paths[:50])
+        if all_paths
+        else "(empty workspace)"
+    )
 
     file_section = "\n\n".join(
         f"### {path}\n```\n{content}\n```"
@@ -76,8 +103,9 @@ def run_reviewer(task: PlanTask, workspace: str, coder_summary: str = "") -> dic
                 f"Description: {task['description']}\n"
                 f"Acceptance Criteria:\n"
                 + "\n".join(f"  - {c}" for c in task["acceptance_criteria"])
-                + f"\n\nCoder's change summary:\n{coder_summary}\n\n"
-                f"Workspace files:\n{file_section}\n\n"
+                + f"\n\nCoder's change summary:\n{coder_summary}\n"
+                + listing_hint
+                + f"\n\nFile contents:\n{file_section}\n\n"
                 "Produce your review as a JSON object."
             )
         ),

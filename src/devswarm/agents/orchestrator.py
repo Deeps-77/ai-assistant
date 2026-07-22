@@ -16,29 +16,31 @@ from devswarm.graph.state import DevSwarmState
 
 
 _ROUTE_PROMPT = """\
-Given the conversation so far and the current state, decide what to do next.
+You are the DevSwarm Orchestrator. Understand the user's intent from their message and decide what to do.
 
 Current mode: {mode}
 Plan status: {plan_status}
 Current task index: {task_index} / {total_tasks}
-Last user message: {last_user_message}
+Last user message: "{last_user_message}"
 
 Respond with a JSON object:
 {{
   "reasoning": "brief explanation of your decision",
   "next_agent": "<one of: planner | coder | reviewer | tester | hitl | done>",
-  "message_to_user": "what to tell the user right now (empty string if routing silently)"
+  "message_to_user": "what to tell the user right now (empty string if routing silently)",
+  "mode": "<the mode to switch to: plan | build | idle>"
 }}
 
-Rules:
-- If mode is "plan" and there is no plan yet → next_agent = "planner"
-- If mode is "plan" and there is an unapproved plan → next_agent = "hitl" (checkpoint: after_plan)
+Routing rules (apply AFTER understanding user intent):
+- If user is just greeting, chatting, or asking a question (not a task request) → respond directly, next_agent="done", mode="idle"
+- If user describes a task/feature/bug → set mode="plan", next_agent="planner" (to create a plan)
+- If mode is "plan" and there is an unapproved plan → next_agent="hitl" (pending approval)
 - If mode is "build" and current_task_index < total_tasks:
     - If current task status is "todo" or "in_progress" → next_agent = "coder"
     - If current task status is "review" → next_agent = "reviewer"
     - If current task status is "done" → next_agent = "tester" (if not yet tested)
-- If all tasks are done → next_agent = "done"
-- If the user just sent a redirect/clarification mid-build → next_agent = "planner" to replan
+- If all tasks are done → next_agent = "done", mode="idle"
+- If the user sends a redirect/clarification mid-build → next_agent = "planner", mode="plan"
 """
 
 
@@ -92,9 +94,12 @@ def run_orchestrator(state: DevSwarmState) -> dict[str, Any]:
     decision = _extract(raw)
     next_agent = decision.get("next_agent", "done")
     msg_to_user = decision.get("message_to_user", "")
+    mode = decision.get("mode")
 
     updates: dict[str, Any] = {"next_agent": next_agent}
     if msg_to_user:
         updates["messages"] = [AIMessage(content=f"[Orchestrator] {msg_to_user}")]
+    if mode:
+        updates["mode"] = mode
 
     return updates

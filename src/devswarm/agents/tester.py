@@ -84,7 +84,7 @@ def run_tester(task: PlanTask, workspace: str, context: str = "") -> dict:
     try:
         result = agent.invoke(
             {"messages": [HumanMessage(content=prompt_text)]},
-            {"recursion_limit": 25},
+            {"recursion_limit": 50},
         )
         messages = result.get("messages", [])
         tool_calls = []

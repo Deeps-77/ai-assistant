@@ -5,27 +5,71 @@ Provides the LLM factory using ChatOllama + per-role system prompts.
 
 from __future__ import annotations
 
+from typing import Any
+
+from langchain_core.messages import AIMessage
+from langchain_core.language_models import LanguageModelInput
 from langchain_ollama import ChatOllama
 
 from devswarm.config import settings
 
 
-def make_llm(temperature: float = 0.0) -> ChatOllama:
+class TokenTracker:
+    """Accumulates token usage across all LLM calls by intercepting invoke()."""
+
+    def __init__(self) -> None:
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+
+    def extract_from(self, response: AIMessage) -> None:
+        md = (response.response_metadata or {})
+        self.prompt_tokens += md.get("prompt_eval_count", 0) or 0
+        self.completion_tokens += md.get("eval_count", 0) or 0
+
+    @property
+    def total(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def snapshot(self) -> dict[str, int]:
+        return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens}
+
+
+# Singleton shared by all LLM instances
+token_tracker = TokenTracker()
+
+
+class TrackingChatOllama(ChatOllama):
+    """ChatOllama subclass that records token counts on every invoke."""
+
+    def invoke(
+        self,
+        input: LanguageModelInput,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AIMessage:
+        result = super().invoke(input, config=config, **kwargs)
+        token_tracker.extract_from(result)
+        return result
+
+
+def make_llm(temperature: float = 0.0) -> TrackingChatOllama:
     """
-    Build a ChatOllama instance from .env settings.
-    The OLLAMA_API_KEY is passed as the 'client_kwargs' authorization header,
-    matching the cloud Ollama API pattern.
+    Build a TrackingChatOllama instance from .env settings.
+    Only includes Authorization header when OLLAMA_API_KEY is set.
     """
-    return ChatOllama(
+    client_kwargs: dict = {}
+    if settings.ollama_api_key:
+        client_kwargs["headers"] = {
+            "Authorization": f"Bearer {settings.ollama_api_key}",
+        }
+
+    return TrackingChatOllama(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
-        client_kwargs={
-            "headers": {
-                "Authorization": f"Bearer {settings.ollama_api_key}",
-            }
-        },
+        client_kwargs=client_kwargs,
         temperature=temperature,
-        num_predict=4096,
+        num_predict=settings.ollama_num_predict,
+        num_ctx=settings.ollama_num_ctx,
     )
 
 

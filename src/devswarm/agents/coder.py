@@ -47,7 +47,7 @@ def run_coder(task: PlanTask, workspace: str, context: str = "") -> dict:
     try:
         result = agent.invoke(
             {"messages": [HumanMessage(content=prompt_text)]},
-            {"recursion_limit": 30},
+            {"recursion_limit": 50},
         )
         messages = result.get("messages", [])
         # Extract tool calls from message history

@@ -96,6 +96,7 @@ def hitl_node(state: DevSwarmState) -> dict[str, Any]:
     """
     Pause execution and wait for human approval via LangGraph interrupt().
     The CLI shell will resume the graph with the user's response.
+    Handles plan approval (after_plan checkpoint).
     """
     pending = state.get("hitl_pending")
     if not pending:
@@ -143,6 +144,98 @@ def hitl_node(state: DevSwarmState) -> dict[str, Any]:
     return updates
 
 
+# ── HITL after Coder node ─────────────────────────────────────────────────────
+
+def hitl_after_coder_node(state: DevSwarmState) -> dict[str, Any]:
+    """
+    Pause after coder finishes, before reviewer runs.
+    Lets the human review the code and approve/reject/redirect.
+    """
+    pending = state.get("hitl_pending")
+    if not pending:
+        return {"hitl_pending": None, "next_agent": "reviewer"}
+
+    human_response: str = interrupt(pending)
+    response_lower = human_response.strip().lower()
+
+    if response_lower in ("approve", "yes", "y", "ok", "proceed", "go"):
+        updates: dict[str, Any] = {
+            "hitl_pending": None,
+            "next_agent": "reviewer",
+            "messages": [AIMessage(content="[HITL] ✅ Code approved. Starting review...")],
+        }
+    elif response_lower in ("reject", "no", "n", "cancel", "stop", "abort"):
+        updates = {
+            "hitl_pending": None,
+            "mode": "idle",
+            "next_agent": "done",
+            "messages": [AIMessage(content="[HITL] ❌ Code rejected. Stopping.")],
+        }
+    else:
+        updates = {
+            "hitl_pending": None,
+            "mode": "plan",
+            "next_agent": "planner",
+            "messages": [
+                AIMessage(content=f"[HITL] Redirecting with feedback: {human_response}")
+            ],
+        }
+
+    audit = _append_audit(
+        state, "hitl", "code_approval",
+        {"checkpoint": "after_coder", "response": human_response},
+        {"decision": response_lower},
+    )
+    updates["audit_log"] = audit
+    return updates
+
+
+# ── HITL after Reviewer node ──────────────────────────────────────────────────
+
+def hitl_after_reviewer_node(state: DevSwarmState) -> dict[str, Any]:
+    """
+    Pause after reviewer finishes, before tester runs.
+    Lets the human approve the review and decide whether to run tests.
+    """
+    pending = state.get("hitl_pending")
+    if not pending:
+        return {"hitl_pending": None, "next_agent": "tester"}
+
+    human_response: str = interrupt(pending)
+    response_lower = human_response.strip().lower()
+
+    if response_lower in ("approve", "yes", "y", "ok", "proceed", "go"):
+        updates: dict[str, Any] = {
+            "hitl_pending": None,
+            "next_agent": "tester",
+            "messages": [AIMessage(content="[HITL] ✅ Review approved. Starting tests...")],
+        }
+    elif response_lower in ("reject", "no", "n", "cancel", "stop", "abort"):
+        updates = {
+            "hitl_pending": None,
+            "mode": "idle",
+            "next_agent": "done",
+            "messages": [AIMessage(content="[HITL] ❌ Review rejected. Stopping.")],
+        }
+    else:
+        updates = {
+            "hitl_pending": None,
+            "mode": "plan",
+            "next_agent": "planner",
+            "messages": [
+                AIMessage(content=f"[HITL] Redirecting with feedback: {human_response}")
+            ],
+        }
+
+    audit = _append_audit(
+        state, "hitl", "review_approval",
+        {"checkpoint": "after_reviewer", "response": human_response},
+        {"decision": response_lower},
+    )
+    updates["audit_log"] = audit
+    return updates
+
+
 # ── Coder node ────────────────────────────────────────────────────────────────
 
 def coder_node(state: DevSwarmState) -> dict[str, Any]:
@@ -172,7 +265,7 @@ def coder_node(state: DevSwarmState) -> dict[str, Any]:
         if result.get("tool_calls"):
             msg_lines.append(f"\n_Tools used: {len(result['tool_calls'])}_")
         updated_plan[idx] = {**task, "status": "review"}
-        next_a = "reviewer"
+        next_a = "hitl_after_coder"
 
     audit = _append_audit(
         state, "coder", "implement_task",
@@ -180,9 +273,21 @@ def coder_node(state: DevSwarmState) -> dict[str, Any]:
         {"summary": result.get("summary", ""), "error": result.get("error")},
     )
 
+    hitl_pending = (
+        HITLRequest(
+            checkpoint="after_coder",
+            action_summary=f"Review code for task: {task['title']}",
+            context={"task_id": task["id"], "summary": result.get("summary", "")},
+            options=["approve", "reject", "edit"],
+        )
+        if next_a == "hitl_after_coder"
+        else None
+    )
+
     return {
         "plan": updated_plan,
         "next_agent": next_a,
+        "hitl_pending": hitl_pending,
         "audit_log": audit,
         "tool_calls_used": state.get("tool_calls_used", 0) + len(result.get("tool_calls", [])),
         "messages": [AIMessage(content="\n".join(msg_lines))],
@@ -228,15 +333,26 @@ def reviewer_node(state: DevSwarmState) -> dict[str, Any]:
 
     if verdict == "approved":
         updated_plan[idx] = {**task, "status": "done"}
-        next_a = "tester"
+        next_a = "hitl_after_reviewer"
+        current_attempts = 0  # reset on success
     elif verdict == "rejected":
         updated_plan[idx] = {**task, "status": "blocked"}
         next_a = "done"
+        current_attempts = state.get("review_attempts", 0)
     else:
-        # needs_changes → send back to coder
-        updated_plan[idx] = {**task, "status": "todo"}
-        next_a = "coder"
-        msg_lines.append("\n_Sending back to Coder for revisions..._")
+        current_attempts = state.get("review_attempts", 0) + 1
+        if current_attempts >= settings.max_review_attempts:
+            # Max retries exceeded → block instead of looping again
+            updated_plan[idx] = {**task, "status": "blocked"}
+            next_a = "done"
+            msg_lines.append(
+                f"\n_Max review attempts ({settings.max_review_attempts}) reached. Task blocked._"
+            )
+        else:
+            # needs_changes → send back to coder (no HITL, loop directly)
+            updated_plan[idx] = {**task, "status": "todo"}
+            next_a = "coder"
+            msg_lines.append("\n_Sending back to Coder for revisions..._")
 
     audit = _append_audit(
         state, "reviewer", "review_task",
@@ -244,11 +360,24 @@ def reviewer_node(state: DevSwarmState) -> dict[str, Any]:
         {"verdict": verdict, "findings_count": len(findings)},
     )
 
+    hitl_pending = (
+        HITLRequest(
+            checkpoint="after_reviewer",
+            action_summary=f"Proceed with tests for: {task['title']}",
+            context={"task_id": task["id"], "verdict": verdict, "findings": findings[:5]},
+            options=["approve", "reject", "edit"],
+        )
+        if next_a == "hitl_after_reviewer"
+        else None
+    )
+
     return {
         "plan": updated_plan,
         "next_agent": next_a,
+        "hitl_pending": hitl_pending,
         "audit_log": audit,
         "messages": [AIMessage(content="\n".join(msg_lines))],
+        "review_attempts": current_attempts,
     }
 
 

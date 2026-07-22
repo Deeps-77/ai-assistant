@@ -208,6 +208,33 @@ def render_audit_log(audit_log: list[dict]) -> None:
     console.print(table)
 
 
+# ── Token usage bar ───────────────────────────────────────────────────────────
+
+def _fmt_tokens(n: int) -> str:
+    """Format token count: 1234 → '1.2K', 1234567 → '1.2M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def render_token_usage(prompt_tokens: int, completion_tokens: int, num_ctx: int) -> None:
+    """Render a compact token-and-context status line."""
+    total = prompt_tokens + completion_tokens
+    ctx_pct = min(100.0, round(total / num_ctx * 100, 1)) if num_ctx else 0
+    ctx_bar_len = 20
+    filled = int(ctx_bar_len * ctx_pct / 100)
+    bar = "█" * filled + "░" * (ctx_bar_len - filled)
+
+    text = (
+        f"[bold]⬆ {_fmt_tokens(prompt_tokens)}[/bold] "
+        f"[bold]⬇ {_fmt_tokens(completion_tokens)}[/bold]  "
+        f"[dim]·  ctx {bar}  {_fmt_tokens(total)} / {_fmt_tokens(num_ctx)} ({ctx_pct}%)[/dim]"
+    )
+    console.print(text)
+
+
 # ── Generic info / error ──────────────────────────────────────────────────────
 
 def print_info(msg: str) -> None:
